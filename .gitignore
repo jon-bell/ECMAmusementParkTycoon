@@ -1,0 +1,4 @@
+# Original game files are never committed (user supplies their own copy)
+game/
+*.iso
+out/
