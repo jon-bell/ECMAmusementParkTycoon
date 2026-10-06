@@ -27,5 +27,7 @@ enum {
     TR_END      = 0x15, /* frames, ticks, rng draws */
     TR_INJ_IN   = 0x16, /* eax, ebx, ecx  of an injected call */
     TR_INJ_IN2  = 0x17, /* edx, esi, edi  of an injected call */
+    TR_MSTATE   = 0x18, /* tick, masked state hash lo, hi: as TR_STATE with OS-derived dwords
+                           (heap/mapping addresses, handles; rcthook.c mask) hashed as 0       */
 };
 #endif

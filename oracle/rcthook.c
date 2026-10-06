@@ -46,6 +46,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "trace.h"
+#include "spike.h"
 
 /* ---------------------------------------------------------------- binary addresses */
 #define A_RNG_STORE    0x5DF42Au   /* mov [srand1],eax  (eax = drawn value)            */
@@ -110,6 +111,15 @@ static HANDLE open_out(const char *name)
     char p[MAX_PATH]; snprintf(p, sizeof p, "%s\\%s", g_out, name);
     return CreateFileA(p, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_ALWAYS, 0, NULL);
 }
+HANDLE spike_open(const char *name) { return open_out(name); }
+void spike_log(const char *fmt, ...)
+{
+    char b[1024]; va_list ap; va_start(ap, fmt);
+    int n = vsnprintf(b, sizeof b, fmt, ap); va_end(ap);
+    if (n < 0) return;
+    if (n > (int)sizeof b - 1) n = sizeof b - 1;
+    DWORD w; if (g_log != INVALID_HANDLE_VALUE) WriteFile(g_log, b, n, &w, NULL);
+}
 
 /* ---------------------------------------------------------------- run state */
 static uint32_t g_vt = VT_BASE;          /* virtual clock, ms */
@@ -119,28 +129,56 @@ static int g_quitting;
 static int g_loading;                    /* a scenario load is in progress (it longjmps out) */
 
 /* ---------------------------------------------------------------- state hashing */
-static uint64_t hash_range(uint32_t lo, uint32_t hi)
+/* State dwords that hold values derived from the OS rather than from the game: addresses of
+ * memory Wine allocated or mapped, and handles. Measured by shifting the heap/mapping layout and
+ * handle numbering (RCTHOOK_SPIKE=heapshift): across the whole corpus exactly these differ while
+ * every RNG draw stays identical.
+ *   0x8DC0B4 + 16*i, i < 38365  sprite table: pointer into the CSG1.DAT mapping (from CSG1I.DAT)
+ *   0x5F96C0, 0x5F96D0          pointers into the screen DIB section
+ *   0x99FB7C, 0x99FB8C          screen drawing context: DIB bits
+ *   0x9A2008, 0x9A200C, 0x9A2010  CSG1.DAT mapping base and a transient OS address (tick 1)
+ *   0x5F88A4                    file handle of the last scenario file opened */
+#define SPRITE_LO 0x8DC0B4u
+#define SPRITE_N  38365u
+static const uint32_t mask_single[] = {0x5F88A4, 0x5F96C0, 0x5F96D0, 0x99FB7C, 0x99FB8C, 0x9A2008, 0x9A200C, 0x9A2010};
+static int masked(uint32_t a)
 {
-    /* FNV-1a over 32-bit words, 64-bit state */
-    uint64_t h = 0xcbf29ce484222325ull;
+    if (a >= SPRITE_LO && a < SPRITE_LO + 16 * SPRITE_N) return ((a - SPRITE_LO) & 15) == 0;
+    for (unsigned i = 0; i < sizeof mask_single / 4; i++) if (a == mask_single[i]) return 1;
+    return 0;
+}
+
+/* FNV-1a over 32-bit words, 64-bit state: raw, and with masked dwords read as 0 */
+static uint64_t hash_range(uint32_t lo, uint32_t hi, uint64_t *mh)
+{
+    uint64_t h = 0xcbf29ce484222325ull, m = *mh;
     const uint32_t *p = (const uint32_t *)lo, *e = (const uint32_t *)(hi & ~3u);
-    for (; p < e; p++) { h ^= *p; h *= 0x100000001b3ull; }
-    for (const uint8_t *q = (const uint8_t *)e; q < (const uint8_t *)hi; q++) { h ^= *q; h *= 0x100000001b3ull; }
+    int maybe = (hi > 0x5F88A4 && lo <= 0x9A2010);
+    for (; p < e; p++) {
+        uint32_t w = *p;
+        h ^= w; h *= 0x100000001b3ull;
+        m ^= (maybe && masked((uint32_t)p)) ? 0 : w; m *= 0x100000001b3ull;
+    }
+    for (const uint8_t *q = (const uint8_t *)e; q < (const uint8_t *)hi; q++) {
+        h ^= *q; h *= 0x100000001b3ull; m ^= *q; m *= 0x100000001b3ull;
+    }
+    *mh = m;
     return h;
 }
 static void record_state(uint32_t kind)
 {
-    uint64_t total = 0xcbf29ce484222325ull;
+    uint64_t total = 0xcbf29ce484222325ull, mtotal = 0xcbf29ce484222325ull;
     uint32_t idx = 0;
     static const uint32_t ranges[2][2] = {{STATE_LO, STATE_HI}, {STATE2_LO, STATE2_HI}};
     for (int r = 0; r < 2; r++)
         for (uint32_t a = ranges[r][0]; a < ranges[r][1]; a += CHUNK, idx++) {
             uint32_t b = a + CHUNK < ranges[r][1] ? a + CHUNK : ranges[r][1];
-            uint64_t h = hash_range(a, b);
+            uint64_t h = hash_range(a, b, &mtotal);
             if (g_chunks) trec(TR_CHUNK, idx, (uint32_t)h, (uint32_t)(h >> 32));
             total = (total ^ h) * 0x100000001b3ull;
         }
     trec(kind, g_tick, (uint32_t)total, (uint32_t)(total >> 32));
+    trec(TR_MSTATE, g_tick, (uint32_t)mtotal, (uint32_t)(mtotal >> 32));
 }
 static void dump_state(const char *tag)
 {
@@ -280,6 +318,7 @@ static void load_script(const char *path)
 static void do_quit(void)
 {
     g_quitting = 1;
+    spike_quit();
     record_state(TR_FINAL);
     trec(TR_END, g_frame, g_tick, g_rng_draws);
     tflush();
@@ -406,8 +445,8 @@ static void __cdecl h_rng(regs_t *r)
 }
 static void __cdecl h_tick(regs_t *r)
 {
-    (void)r;
     g_tick++;
+    spike_tick(&r->eflags, g_tick);
     trec(TR_TICK, g_tick, *(uint32_t *)A_SRAND0, *(uint32_t *)A_SRAND1);
     record_state(TR_STATE);
     run_actions(W_TICK);
@@ -424,6 +463,7 @@ static void __cdecl h_frame(regs_t *r)
         g_load_frame = g_frame + 1;
     }
     g_frame++;
+    spike_frame(g_frame, g_tick);
     trec(TR_FRAME, g_frame, g_vt, g_tick);
 }
 static void __cdecl h_frame_body(regs_t *r)
@@ -440,6 +480,7 @@ static void __cdecl h_frame_body(regs_t *r)
 static void __cdecl h_command(regs_t *r)
 {
     uint32_t caller = *(uint32_t *)ORIG_ESP(r) - 5;
+    if (caller < 0x401000 || caller >= 0x9BD000) caller = 0xFFFFFFFF;   /* injected by the script */
     trec(TR_COMMAND, g_tick, r->esi | (r->ebx & 0xff) << 8 | *(uint8_t *)0x5F4A6A << 16, caller);
     trec(TR_REGS_IN, r->eax, r->ebx, r->ecx); trec(TR_REGS_IN2, r->edx, r->esi, r->edi);
 }
@@ -640,6 +681,28 @@ static void log_backtrace(void)
     logf_("\n");
 }
 
+/* Modal dialogs and message boxes would block the run until its timeout. None appears in normal
+ * play from a script, so any one is logged with a backtrace and ends the run (exit code 4).
+ * (The modeless dialog the game creates at startup, CreateDialogParamA #101, is normal.) */
+static void dialog_fatal(const char *what, const char *text)
+{
+    logf_("FATAL: %s: %s (frame %u tick %u)\n", what, text ? text : "", g_frame, g_tick);
+    log_backtrace();
+    tflush();
+    if (g_log != INVALID_HANDLE_VALUE) CloseHandle(g_log);
+    TerminateProcess(GetCurrentProcess(), 4);
+}
+static int WINAPI p_MessageBoxA(HWND h, LPCSTR text, LPCSTR cap, UINT t)
+{
+    (void)h; (void)t; char b[512]; snprintf(b, sizeof b, "[%s] %s", cap ? cap : "", text ? text : "");
+    dialog_fatal("MessageBoxA", b); return 0;
+}
+static INT_PTR WINAPI p_DialogBoxParamA(HINSTANCE i, LPCSTR tmpl, HWND h, DLGPROC p, LPARAM l)
+{
+    (void)i; (void)h; (void)p; (void)l; char b[64];
+    snprintf(b, sizeof b, "template %s%u", HIWORD(tmpl) ? "" : "#", HIWORD(tmpl) ? 0 : LOWORD(tmpl));
+    dialog_fatal("DialogBoxParamA", HIWORD(tmpl) ? tmpl : b); return 0;
+}
 static HANDLE WINAPI p_CreateFileA(LPCSTR n, DWORD acc, DWORD sh, LPSECURITY_ATTRIBUTES sa, DWORD cd, DWORD fl, HANDLE t)
 {
     HANDLE h = CreateFileA(n, acc, sh, sa, cd, fl, t);
@@ -751,12 +814,20 @@ static void install(void)
     IAT(0x5E71A8, p_FindNextFileA);
     IAT(0x5E71A4, p_FindClose);
     IAT(0x5E71C4, p_CreateFileA);
+    /* modal UI: fail fast */
+    IAT(0x5E72CC, p_MessageBoxA);
+    IAT(0x5E729C, p_DialogBoxParamA);
 
     hook_at(A_RNG_STORE, 5, h_rng);
     hook_at(A_TICK, 6, h_tick);
     hook_at(A_FRAME, 7, h_frame);
     hook_at(A_FRAME_BODY, 5, h_frame_body);
     hook_at(A_DO_COMMAND, 7, h_command);
+    static const uint32_t hooked[][2] = {
+        {A_RNG_STORE, A_RNG_STORE + 5}, {A_TICK, A_TICK + 6}, {A_FRAME, A_FRAME + 7},
+        {A_FRAME_BODY, A_FRAME_BODY + 5}, {A_DO_COMMAND, A_DO_COMMAND + 7}};
+    spike_set_hook_ranges(hooked, 5);
+    spike_install((uint32_t)g_stubs, (uint32_t)g_stubs + 65536);
 }
 
 BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, LPVOID r)

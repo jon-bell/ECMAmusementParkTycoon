@@ -5,7 +5,8 @@
   rcttrace.py finished <trace.bin>          exit 0 iff the run reached the script's quit
   rcttrace.py compare  <a.bin> <b.bin> [projection]
                                          first divergence (exit 0 iff identical); projections:
-                                         core, game, input, os, game+input (default)
+                                         rng, masked, core, game, input, os,
+                                         game+input (default)
   rcttrace.py rng      <trace.bin> [n]      print the first n RNG draws
 """
 import os
@@ -49,13 +50,17 @@ def load(path):
 #   input : what the script fed in (keys, cursor, mouse events, pokes, injected command registers).
 #   os    : what the OS fed in or the instrument observed (frames and the virtual clock, window
 #           messages delivered/dropped, file opens, run configuration).
-CORE = {K[k] for k in ('TR_RNG', 'TR_TICK', 'TR_STATE', 'TR_CHUNK', 'TR_FINAL')}
+CORE = {K[k] for k in ('TR_RNG', 'TR_TICK', 'TR_STATE', 'TR_CHUNK', 'TR_FINAL', 'TR_MSTATE')}
 GAME = CORE | {K[k] for k in ('TR_COMMAND', 'TR_REGS_IN', 'TR_REGS_IN2', 'TR_REGS_OUT', 'TR_REGS_OUT2',
                               'TR_REGS_OUT3', 'TR_LOAD', 'TR_NOTE', 'TR_END')}
 INPUT = {K[k] for k in ('TR_INPUT', 'TR_INJECT', 'TR_INJ_IN', 'TR_INJ_IN2')}
 OS = {K[k] for k in ('TR_HEADER', 'TR_FRAME', 'TR_MSG', 'TR_MSG_DROP', 'TR_FILE')}
 assert CORE | GAME | INPUT | OS == set(_kinds), set(_kinds) - (CORE | GAME | INPUT | OS)
-PROJECTIONS = {'core': CORE, 'game': GAME, 'input': INPUT, 'os': OS, 'game+input': GAME | INPUT}
+RNG = {K['TR_RNG'], K['TR_TICK']}
+# masked: RNG + state with OS-derived dwords (addresses of OS-allocated memory, handles) excluded;
+# the comparator for programs that do not reproduce Wine's memory layout (Stage 1 lift)
+MASKED = RNG | {K['TR_MSTATE']}
+PROJECTIONS = {'rng': RNG, 'masked': MASKED, 'core': CORE, 'game': GAME, 'input': INPUT, 'os': OS, 'game+input': GAME | INPUT}
 
 
 def projection(recs, kinds=None):
@@ -70,7 +75,7 @@ def fmt(r):
         return f'RNG tick={a} site={b:#08x} value={c:#010x}'
     if k == 'TR_TICK':
         return f'TICK {a} srand0={b:#010x} srand1={c:#010x}'
-    if k in ('TR_STATE', 'TR_FINAL'):
+    if k in ('TR_STATE', 'TR_FINAL', 'TR_MSTATE'):
         return f'{k[3:]} tick={a} hash={c:08x}{b:08x}'
     if k == 'TR_CHUNK':
         lo, hi = chunk_range(a)

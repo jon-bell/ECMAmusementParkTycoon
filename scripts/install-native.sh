@@ -45,5 +45,8 @@ ln -sfn "$ROOT/game/cd" "$PFX/dosdevices/d:"
 wine reg add 'HKLM\Software\Wine\Drives' /v d: /d cdrom /f >/dev/null
 wineserver -w
 rm -f "$ROOT/game/.xdisplay"
+# Runs hard-link drive_c/windows from this prefix (scripts/oracle-run.sh); read-only files make an
+# in-place write through a link fail instead of altering the pristine prefix.
+find "$PFX/drive_c/windows" -type f -exec chmod a-w {} +
 md5sum "$GAMEDIR/rct.exe"
 echo "pristine prefix ready: $PFX"

@@ -112,7 +112,9 @@ The oracle runs natively (Ubuntu 24.04, Wine 9.0 win32, Xvfb). See `README.md` t
 ```
 oracle/      hook DLL built as dinput.dll: pins nondeterminism, traces RNG/state/commands, replays scripts
 scripts/     setup-host.sh, install-native.sh, oracle-run.sh, gate-determinism.sh
-tools/       rcttrace.py (read/compare traces), gate_determinism.py, rctdis.py (disassembly helper)
+tools/       rcttrace.py (read/compare traces), gate_determinism.py, rctdis.py, rctcfg.py (static
+             code map), coverbisect.py, ptrmask.py, dumpdiff.py
+docs/        stage1-scope.md: spike measurements and proposed Stage 1 decisions
 corpus/      input scripts: public/ (porting may use) and heldout/ (porting never sees)
 install/     registry Setup.exe writes
 game/        User-supplied CD contents and the pristine prefix (git-ignored)
@@ -124,7 +126,8 @@ scripts/setup-host.sh                         # host packages (sudo), .venv for 
 scripts/install-native.sh ~/RCTYCOON.iso      # game/cd + pristine prefix game/prefix
 scripts/oracle-run.sh out/runs/x <script>     # one pinned run -> trace.bin, hook.log
 scripts/gate-determinism.sh                   # Stage 0 gate -> out/gate/<time>/report.txt
-python3 tools/rcttrace.py compare A/trace.bin B/trace.bin [core|game|input|os]
+python3 tools/rcttrace.py compare A/trace.bin B/trace.bin [rng|masked|core|game|input|os]
+scripts/oracle-run.sh out/runs/x <script> -- RCTHOOK_SPIKE=apicount,codewatch   # measurement modes
 ```
 
 Shell notes: unset `TMPDIR` before any `wine`/`wineserver` command (Ubuntu's Wine 9.0 aborts

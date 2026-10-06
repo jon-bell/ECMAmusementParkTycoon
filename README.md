@@ -27,7 +27,9 @@ imports the registry keys Setup writes (`install/rct1-install.reg`).
 ```
 oracle/      hook DLL (built as dinput.dll): pins, trace, input replay; README documents all of it
 scripts/     setup-host.sh, install-native.sh, oracle-run.sh, gate-determinism.sh
-tools/       rcttrace.py (read/compare traces), gate_determinism.py, rctdis.py (disassembly helper)
+tools/       rcttrace.py (read/compare traces), gate_determinism.py, rctdis.py, rctcfg.py (code map),
+             coverbisect.py, ptrmask.py, dumpdiff.py
+docs/        stage1-scope.md
 corpus/      input scripts: public/ and heldout/ (see corpus/README.md)
 install/     registry written by Setup.exe
 game/        your CD contents and the pristine prefix (git-ignored)
@@ -46,7 +48,14 @@ lists what a pass does not certify.
 
 Latest result (2026-10-06, `scripts/gate-determinism.sh`): **PASS**. 7 cases (4 public, 3
 held-out). Per run pair: 24,216 ticks, 477,705 RNG draws and 24,216 full-state hashes compared,
-all bit-identical. All 4 mutants were detected at their injection point.
+all bit-identical. Every case's layout-shifted run is identical under the masked projection. All 4
+mutants were detected at their injection point.
+
+## Stage 1 scoping
+
+`docs/stage1-scope.md` has the measurements (code map, instruction set, self-modifying code,
+OS-derived state, memory model, OS surface, work per tick, corpus coverage), the decisions
+proposed for review, and a work order.
 
 ### Decisions proposed for human review (principle 8)
 

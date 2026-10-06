@@ -19,7 +19,12 @@ unset TMPDIR   # Ubuntu's Wine 9.0 wineserver aborts ("free(): invalid pointer")
 if [[ -z "${ORACLE_BIN:-}" ]]; then make -s -C "$ROOT/oracle"; ORACLE_BIN="$ROOT/out/oracle-bin"; fi
 
 rm -rf "$RUN"; mkdir -p "$RUN"; RUN="$(cd "$RUN" && pwd)"
-cp -a "$ROOT/game/prefix" "$RUN/prefix"
+# Fresh prefix per run. drive_c/windows (about 580 MB, never written during a run; its files are
+# read-only in the pristine prefix) is hard-linked; everything else, including the game directory
+# and the registry files the run does write, is copied.
+mkdir -p "$RUN/prefix"
+tar -C "$ROOT/game/prefix" --exclude=./drive_c/windows -cf - . | tar -C "$RUN/prefix" -xf -
+cp -al "$ROOT/game/prefix/drive_c/windows" "$RUN/prefix/drive_c/windows"
 [[ -n "$SCRIPT" ]] && cp "$SCRIPT" "$RUN/script.txt"
 
 # Private X display; Xvfb picks a free display number itself (-displayfd), so parallel runs
@@ -49,7 +54,7 @@ RC=$?
 set -e
 WINEPREFIX="$RUN/prefix" wineserver -k 2>/dev/null || true
 WINEPREFIX="$RUN/prefix" wineserver -w 2>/dev/null || true
-rm -rf "$RUN/prefix"
+[[ -n "${ORACLE_KEEP_PREFIX:-}" ]] || rm -rf "$RUN/prefix"
 python3 -I "$ROOT/tools/rcttrace.py" summary "$RUN/trace.bin" > "$RUN/summary.txt" 2>&1 || true
 if python3 -I "$ROOT/tools/rcttrace.py" finished "$RUN/trace.bin"; then exit 0; fi
 echo "oracle run did not reach quit (wine rc=$RC); see $RUN/wine.log and $RUN/hook.log" >&2

@@ -27,6 +27,16 @@ The state hash covers DATASEG `[0x5F4000, 0x9A161C)` and DataSeg `[0x9A2000, 0x9
 FNV-1a over 32-bit words: one 64-bit hash per tick, plus one per 64 KiB chunk so that a divergence
 can be localised.
 
+A second, **masked** hash (`TR_MSTATE`) reads 38,373 OS-derived dwords as 0:
+
+- the CSG1.DAT sprite pointers at `0x8DC0B4 + 16·i`;
+- the DIB and mapping pointers;
+- one file handle.
+
+The list and the evidence for it are in `rcthook.c` and `docs/stage1-scope.md` (M5). The raw
+hash depends on where Wine put memory; the masked one does not. The gate checks the masked one
+against a layout-shifted run of every case.
+
 ## Pins
 
 | Source | Where it reaches the game | Pin |
@@ -65,9 +75,19 @@ python3 tools/rcttrace.py compare A/trace.bin B/trace.bin [core|game|input|os|ga
 python3 tools/rcttrace.py rng out/runs/x/trace.bin 50
 ```
 
-Projections: **core** (RNG draws, per-tick RNG state and state hashes, final hash) ⊂ **game**
-(core plus commands with registers, injected-command results, loads, totals). **input** holds
-what the script applied; **os** holds frames, the virtual clock, window messages and file opens.
+Projections:
+
+| Projection | Records |
+|---|---|
+| **rng** | RNG draws and per-tick RNG state |
+| **masked** | rng + the masked state hash |
+| **core** | RNG, raw and masked state hashes, chunk hashes, final hash |
+| **game** | core + commands with registers, injected-command results, loads, totals |
+| **input** | what the script applied |
+| **os** | frames, the virtual clock, window messages, file opens |
+
+Commands injected by a script record call site `0xFFFFFFFF`, so traces don't depend on the hook
+DLL's build.
 
 ## Input scripts
 
@@ -106,6 +126,31 @@ Command conventions confirmed against the binary, by capturing what the real UI 
 
 RCT1's command numbering differs from RCT2's beyond the first few entries. Confirm every
 convention with a UI capture before relying on it.
+
+## Failure modes
+
+- A malformed or unreadable script is fatal (exit 3, `FATAL` in `hook.log`).
+- Any modal dialog (`MessageBoxA`, e.g. the game's own "Error Trapper", or `DialogBoxParamA`)
+  ends the run (exit 4) with its text and a backtrace. The modeless dialog the game creates at
+  startup (`CreateDialogParamA` #101) is normal.
+
+## Measurement modes (`RCTHOOK_SPIKE`, `spike.c`)
+
+These are for scoping and debugging only, never for a gate's clean runs. They are
+comma-separated:
+
+| Mode | What it does |
+|---|---|
+| `codewatch` | per-frame diff of the code sections (self-modifying code) |
+| `apicount` | call counts per import, per `GetProcAddress` result and per DirectDraw method → `api_counts.txt` |
+| `heapshift=N` | shifts heap, mappings and handle numbers before the game starts |
+| `memmap` | committed memory regions at quit → `memmap.txt` |
+| `istep=A:B` | single-steps game code from tick A through tick B → `istep_ticks.txt` (instructions per tick) and `istep_cov.bin` (executed-instruction bitmap) |
+| `cover=FILE` | one-shot `int3` at every address in FILE (uint32 LE) → `cover_hits.bin` |
+
+Breakpoints in the self-checksummed range `0x42EAE0–0x431510` are armed only after frame 1. The
+address list must contain only true instruction starts (`tools/rctcfg.py` map v2;
+`tools/coverbisect.py` finds offenders).
 
 ## Running
 

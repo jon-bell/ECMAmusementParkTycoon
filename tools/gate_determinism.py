@@ -40,7 +40,10 @@ PROJECTION (compared)
   game   core + every entry to game_do_command (0x426F56) with registers, results (registers and
          flags) of injected commands, scenario loads, run totals (frames, ticks, draws).
   input  script inputs as applied (keys, cursor, mouse events, injected command registers).
-  Clean runs must agree on game+input. Mutants must be detected by core alone.
+  masked core's RNG records + the state hash with the OS-derived dwords (addresses of memory
+         Wine allocated or mapped, and handles; list in oracle/rcthook.c) hashed as 0.
+  Clean runs must agree on game+input. A run with the heap, mappings and handle numbers shifted
+  must agree with them on masked (the mask is complete). Mutants must be detected by core alone.
 EXCLUDED (not compared, and why)
   .data/.rdata (0x5E7000-0x5F3F74): C runtime and OS glue (heap and DirectX pointers, input
          queues); effects on the game reach DATASEG, which is compared.
@@ -149,6 +152,8 @@ def main():
     for cid, path in cases:
         for i in range(a.runs):
             jobs.append((cid, i, run_dir(out, cid, i), path, run_env(i)))
+        jobs.append((cid, 'shift', os.path.join(out, cid, 'layout-shift'), path,
+                     ('RCTHOOK_SPIKE=heapshift=200003',)))
     mutant_jobs = []
     if not a.no_mutants:
         src = dict(cases).get(MUTANT_CASE) or os.path.join(ROOT, 'corpus', MUTANT_CASE + '.txt')
@@ -198,6 +203,16 @@ def main():
             if not os_same:
                 entry['os_warning'] = {k: os_rep[k] for k in ('kind', 'a', 'b') if k in os_rep}
             c['comparisons'].append(entry)
+        sh = results.get((cid, 'shift'))
+        if sh is not None:
+            if not sh['ok']:
+                ok = False
+                c['layout_shift'] = 'run did not complete'
+            else:
+                same, rep = T.compare(traces[0], T.load(os.path.join(sh['dir'], 'trace.bin')), 'masked')
+                c['layout_shift'] = 'identical (masked)' if same else \
+                    f"DIFFERS at tick {rep['tick']} ({rep['kind']}): {rep['a']} | {rep['b']}"
+                ok = ok and same
         o = c['observations']
         if o['ticks'] == 0 or o['rng_draws'] == 0 or o['state_hashes'] == 0:
             ok = False
@@ -285,6 +300,8 @@ def render(rep):
             if cmp.get('os_warning'):
                 w = cmp['os_warning']
                 L.append(f"        warning ({cmp['runs']}): os-side records differ at {w['kind']}: {w['a']} / {w['b']}")
+        if c.get('layout_shift'):
+            L.append('        layout shift: ' + c['layout_shift'])
         if c.get('reason'):
             L.append('        ' + c['reason'])
         if c.get('vacuous'):

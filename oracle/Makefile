@@ -6,8 +6,8 @@ OUT ?= ../out/oracle-bin
 
 all: $(OUT)/dinput.dll
 
-$(OUT)/dinput.dll: rcthook.c callasm.S trace.h dinput.def | $(OUT)
-	$(CC) $(CFLAGS) -shared -o $@ rcthook.c callasm.S dinput.def -lwinmm -lgdi32 -static-libgcc -Wl,--enable-stdcall-fixup -Wl,--no-insert-timestamp
+$(OUT)/dinput.dll: rcthook.c spike.c spike.h callasm.S trace.h dinput.def | $(OUT)
+	$(CC) $(CFLAGS) -shared -o $@ rcthook.c spike.c callasm.S dinput.def -lwinmm -lgdi32 -static-libgcc -Wl,--enable-stdcall-fixup -Wl,--no-insert-timestamp
 
 $(OUT):
 	mkdir -p $@
