@@ -1,0 +1,3 @@
+# Title sequence: intro logos, then the title park (Diamond Heights, SC3) under the title script.
+# No input. 3000 frames.
+frame 3000 quit

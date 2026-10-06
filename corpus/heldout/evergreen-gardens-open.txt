@@ -1,0 +1,5 @@
+# Evergreen Gardens (SC4): open, 4000 ticks.
+seed 8765432
+frame 1 load 4
+tick 1 cmd 33 ebx=1 edx=0x100
+tick 4000 quit

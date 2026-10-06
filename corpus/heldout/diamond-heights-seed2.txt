@@ -1,0 +1,4 @@
+# Diamond Heights (SC3) with a different seed, park left as loaded, 3000 ticks.
+seed 12345678
+frame 1 load 3
+tick 3000 quit

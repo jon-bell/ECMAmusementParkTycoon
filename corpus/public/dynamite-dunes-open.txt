@@ -1,0 +1,5 @@
+# Dynamite Dunes (SC1): open the park, run 4000 ticks.
+seed 7000000
+frame 1 load 1
+tick 1 cmd 33 ebx=1 edx=0x100        # SET_PARK_OPEN dh=1
+tick 4000 quit

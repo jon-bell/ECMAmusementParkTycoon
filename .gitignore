@@ -2,3 +2,5 @@
 game/
 *.iso
 out/
+.venv/
+__pycache__/

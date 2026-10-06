@@ -1,0 +1,3 @@
+LIBRARY dinput.dll
+EXPORTS
+    DirectInputCreateA = p_DirectInputCreateA@16

@@ -1,0 +1,6 @@
+# Forest Frontiers (SC0): open the park, hire a handyman (left unplaced), run 4000 ticks.
+seed 7000000
+frame 1 load 0
+tick 1 cmd 33 ebx=1 edx=0x100        # SET_PARK_OPEN dh=1
+tick 2 cmd 28 eax=0x8000 ebx=1       # HIRE_NEW_STAFF type 0 (handyman), no location
+tick 4000 quit

@@ -106,17 +106,26 @@ applied to the shipped scenarios. Raw mouse events are not a fuzzing unit.
 
 ## Layout and commands
 
+The oracle runs natively (Ubuntu 24.04, Wine 9.0 win32, Xvfb). See `README.md` to reproduce and
+`oracle/README.md` for the hook points, the pins, the trace format and the script language.
+
 ```
-docker/      Oracle image (Wine win32 prefix + Xvfb) and the registry Setup.exe writes
-scripts/     oracle-shell.sh, install.sh, run-rct.sh, shot.sh
-game/        User-supplied CD contents (git-ignored)
-out/         Logs, screenshots, traces (git-ignored)
+oracle/      hook DLL built as dinput.dll: pins nondeterminism, traces RNG/state/commands, replays scripts
+scripts/     setup-host.sh, install-native.sh, oracle-run.sh, gate-determinism.sh
+tools/       rcttrace.py (read/compare traces), gate_determinism.py, rctdis.py (disassembly helper)
+corpus/      input scripts: public/ (porting may use) and heldout/ (porting never sees)
+install/     registry Setup.exe writes
+game/        User-supplied CD contents and the pristine prefix (git-ignored)
+out/         Runs, traces, dumps, gate reports, builds (git-ignored)
 ```
 
 ```
-docker build -t rct1-oracle docker/
-scripts/oracle-shell.sh     # start container; CD at D:, prefix in volume rct1-prefix
-scripts/install.sh          # reproduce Setup.exe's Full install (first time only)
-scripts/run-rct.sh          # launch the game
-scripts/shot.sh <name>      # screenshot to out/<name>.png
+scripts/setup-host.sh                         # host packages (sudo), .venv for analysis tools
+scripts/install-native.sh ~/RCTYCOON.iso      # game/cd + pristine prefix game/prefix
+scripts/oracle-run.sh out/runs/x <script>     # one pinned run -> trace.bin, hook.log
+scripts/gate-determinism.sh                   # Stage 0 gate -> out/gate/<time>/report.txt
+python3 tools/rcttrace.py compare A/trace.bin B/trace.bin [core|game|input|os]
 ```
+
+Shell notes: unset `TMPDIR` before any `wine`/`wineserver` command (Ubuntu's Wine 9.0 aborts
+otherwise). Never `pkill -f` a pattern that also appears in your own command line.
