@@ -1,0 +1,408 @@
+# API signatures for the API trace (RCTHOOK_SPIKE=apitrace). Hand-written from the Win32/DirectX
+# headers; no game data. Read by oracle/apitrace.c (embedded at build time), by tools/apitrace.py
+# (canonicalisation, decoding) and by the JS host (to emit the same trace). Grammar and rendering
+# rules: oracle/README.md, "API trace".
+#
+#   fn     <name> <conv> <ret> <arg>...        a function the game calls (import, GetProcAddress
+#                                              result, or COM method "Iface::Method", this = arg 1)
+#   iface  <Iface> <method>...                 COM vtable order
+#   cb     <kind> <ret> <arg>...               a game callback the OS calls (B/E records)
+#   struct <NAME> <field>...                   sequential layout, no implicit padding
+#   msg    <msgno> <dir> <lparam kind>         window/dialog message lparam content (kind msgl)
+#
+# conv: std | cdecl.   ret: v x h p s ews eas a@L.
+# arg:  [o|io] base [cond].  cond (out/io args only): ? (return != 0), ?0 (return == 0),
+#                            ?-1 (return != 0xffffffff); when false the content is not rendered.
+#                            base: x h p s ws g cb:K S:T I:I lpal bmi@N msgl s@L ws@L b@L x@L
+#                            dx dh dp da@L
+# struct fields: x1 x2 x4 h4 p4 s4 cN (char[N]: bytes after the first NUL render as "..")
+#                bN (bytes[N]) uN (N unused bytes, e.g. padding: always "..")
+
+# ---------------------------------------------------------------- structs
+struct RECT              x4:left x4:top x4:right x4:bottom
+struct POINT             x4:x x4:y
+struct SYSTEMTIME        x2:year x2:month x2:dow x2:day x2:hour x2:minute x2:second x2:ms
+struct MSG               h4:hwnd x4:message p4:wParam p4:lParam x4:time x4:pt_x x4:pt_y
+struct WIN32_FIND_DATAA  x4:attr b8:ctime b8:atime b8:mtime x4:size_hi x4:size_lo x4:res0 x4:res1 c260:name c14:alt
+struct WNDCLASSA         x4:style p4:wndproc x4:cls_extra x4:wnd_extra h4:hinstance h4:hicon h4:hcursor h4:hbrush s4:menu s4:class
+struct STARTUPINFOA      x4:cb s4:reserved s4:desktop s4:title x4:x x4:y x4:xsize x4:ysize x4:xchars x4:ychars x4:fill x4:flags x2:show x2:cbres2 p4:res2 h4:stdin h4:stdout h4:stderr
+struct CPINFO            x4:max_char_size b2:default_char b12:lead_byte u2:pad
+struct SYSTEM_INFO       x2:arch x2:res x4:page_size p4:min_app p4:max_app x4:active_mask x4:nproc x4:proc_type x4:granularity x2:level x2:revision
+struct OSVERSIONINFOA    x4:size x4:major x4:minor x4:build x4:platform c128:csd
+struct MEMORYSTATUS      x4:length x4:load x4:total_phys x4:avail_phys x4:total_pagefile x4:avail_pagefile x4:total_virtual x4:avail_virtual
+struct MIDIOUTCAPSA      x2:mid x2:pid x4:driver_version c32:name x2:technology x2:voices x2:notes x2:channel_mask x4:support
+struct LOGFONTA          x4:height x4:width x4:escapement x4:orientation x4:weight x1:italic x1:underline x1:strikeout x1:charset x1:out_prec x1:clip_prec x1:quality x1:pitch c32:face
+struct DDSURFACEDESC     x4:size x4:flags x4:height x4:width x4:pitch x4:back_buffers x4:refresh x4:alpha_depth x4:reserved p4:surface b8:ck_dest_overlay b8:ck_dest_blt b8:ck_src_overlay b8:ck_src_blt x4:pf_size x4:pf_flags x4:pf_fourcc x4:pf_bits x4:pf_rmask x4:pf_gmask x4:pf_bmask x4:pf_amask x4:caps
+struct CREATESTRUCTA     p4:params h4:hinstance h4:hmenu h4:parent x4:cy x4:cx x4:y x4:x x4:style s4:name s4:class x4:exstyle
+struct WINDOWPOS         h4:hwnd h4:after x4:x x4:y x4:cx x4:cy x4:flags
+struct MINMAXINFO        x4:res_x x4:res_y x4:maxsize_x x4:maxsize_y x4:maxpos_x x4:maxpos_y x4:mintrack_x x4:mintrack_y x4:maxtrack_x x4:maxtrack_y
+struct NCCALCSIZE_PARAMS x4:r0l x4:r0t x4:r0r x4:r0b x4:r1l x4:r1t x4:r1r x4:r1b x4:r2l x4:r2t x4:r2r x4:r2b p4:wpos
+struct STYLESTRUCT       x4:old x4:new
+struct DIDATAFORMAT      x4:size x4:obj_size x4:flags x4:data_size x4:num_objs p4:objs
+struct OPENFILENAMEA      x4:size h4:owner h4:instance s4:filter s4:custom_filter x4:max_cust_filter x4:filter_index s4:file x4:max_file s4:file_title x4:max_file_title s4:initial_dir s4:title x4:flags x2:file_offset x2:file_extension s4:def_ext x4:cust_data p4:hook s4:template
+struct BITMAPINFOHEADER  x4:size x4:width x4:height x2:planes x2:bpp x4:compression x4:image_size x4:xppm x4:yppm x4:clr_used x4:clr_important
+
+# window and dialog messages whose lparam points to content (kind msgl). dir: in | io
+msg 0x0001 in CREATESTRUCTA
+msg 0x0081 in CREATESTRUCTA
+msg 0x000C in s
+msg 0x0024 io MINMAXINFO
+msg 0x0046 io WINDOWPOS
+msg 0x0047 in WINDOWPOS
+msg 0x007C io STYLESTRUCT
+msg 0x007D in STYLESTRUCT
+msg 0x0083 io NCCALC
+msg 0x0214 io RECT
+msg 0x0216 io RECT
+
+# ---------------------------------------------------------------- callbacks (OS -> game)
+cb wndproc    x h x p msgl
+cb dlgproc    x h x p msgl
+cb enummodes  x S:DDSURFACEDESC p
+cb enumsurf   x h S:DDSURFACEDESC p
+cb ddenum     x g s s p
+cb dsenum     x g s s p
+cb dienum     x p p
+cb dienumobj  x p p
+cb dpenum     x g s x x p
+cb timerproc  v h x x x
+cb timecb     v x x x x x
+
+# ---------------------------------------------------------------- KERNEL32
+fn _lread                   std x   h ob@r x
+fn _lopen                   std h   s x
+fn _lclose                  std x   h
+fn GetTickCount             std x
+fn GetModuleHandleA         std h   s
+fn FindResourceA            std h   h s s
+fn GlobalFree               std h   h
+fn GlobalAlloc              std a@2 x x
+fn LoadResource             std h   h h
+fn LockResource             std p   h
+fn GlobalHandle             std h   p
+fn GetStartupInfoA          std v   oS:STARTUPINFOA
+fn GetCommandLineA          std s
+fn GetVersion               std x
+fn ExitProcess              std v   x
+fn RtlUnwind                std v   p p p x
+fn HeapAlloc                std a@3 h x x
+fn HeapFree                 std x   h x p
+fn GetModuleFileNameA       std x   h os@3 x
+fn TerminateProcess         std x   h x
+fn GlobalUnlock             std x   h
+fn GlobalLock               std p   h
+fn Sleep                    std v   x
+fn InterlockedExchange      std x   p x
+fn LoadLibraryA             std h   s
+fn GetCPInfo                std x   x oS:CPINFO?
+fn GetACP                   std x
+fn GetOEMCP                 std x
+fn SetHandleCount           std x   x
+fn GetStdHandle             std h   x
+fn GetFileType              std x   h
+fn HeapDestroy              std x   h
+fn HeapCreate               std h   x x x
+fn VirtualFree              std x   p x x
+fn VirtualAlloc             std a@2 p x x x
+fn LCMapStringA             std x   x x s@4 x ob@r x
+fn LCMapStringW             std x   x x ws@4 x ob@rx2 x
+fn GetStringTypeA           std x   x x s@4 x ob@4x2
+fn GetStringTypeW           std x   x ws@3 x ob@3x2
+fn FlushFileBuffers         std x   h
+fn SetStdHandle             std x   x h
+fn SetErrorMode             std x   x
+fn GetSystemInfo            std v   oS:SYSTEM_INFO
+fn UnhandledExceptionFilter std x   p
+fn FreeLibrary              std x   h
+fn GetEnvironmentStrings    std eas
+fn GetEnvironmentStringsW   std ews
+fn GetPriorityClass         std x   h
+fn GetProcAddress           std p   h s
+fn GetThreadPriority        std x   h
+fn GetCurrentProcess        std x
+fn GetCurrentThread         std x
+fn SetPriorityClass         std x   h x
+fn SetThreadPriority        std x   h x
+fn GetLogicalDriveStringsA  std x   x ob@r
+fn GetDiskFreeSpaceA        std x   s odx odx odx odx
+fn GetCurrentDirectoryA     std x   x os@1
+fn FindClose                std x   h
+fn FindNextFileA            std x   h oS:WIN32_FIND_DATAA?
+fn FindFirstFileA           std h   s oS:WIN32_FIND_DATAA?-1
+fn DeleteFileA              std x   s
+fn WriteFile                std x   h b@3 x odx p
+fn ReadFile                 std x   h ob@*4? x odx p
+fn SetFilePointer           std x   h x iodx x
+fn UnmapViewOfFile          std x   p
+fn CreateFileA              std h   s x x p x x h
+fn CreateFileMappingA       std h   h p x x x s
+fn MapViewOfFile            std a@5 h x x x x
+fn OutputDebugStringA       std v   s
+fn OpenMutexA               std h   x x s
+fn CloseHandle              std x   h
+fn CreateMutexA             std h   p x s
+fn MultiByteToWideChar      std x   x x s@4 x ob@rx2 x
+fn GetLastError             std x
+fn FormatMessageA           std x   x p x x p x p
+fn GetVersionExA            std x   oS:OSVERSIONINFOA?
+fn GlobalMemoryStatus       std v   oS:MEMORYSTATUS
+fn GetComputerNameA         std x   os iodx
+fn GetSystemTime            std v   oS:SYSTEMTIME
+fn WideCharToMultiByte      std x   x x ws@4 x ob@r x s odx
+fn FreeEnvironmentStringsA  std x   p
+fn FreeEnvironmentStringsW  std x   p
+fn IsProcessorFeaturePresent std x  x
+
+# ---------------------------------------------------------------- USER32
+fn MessageBoxA              std x   h s s x
+fn GetParent                std h   h
+fn ClientToScreen           std x   h ioS:POINT
+fn GetClientRect            std x   h oS:RECT?
+fn SystemParametersInfoA    std x   x x ox@=16? x
+fn GetCursorPos             std x   oS:POINT?
+fn SetWindowPos             std x   h h x x x x x
+fn DestroyIcon              std x   h
+fn DestroyCursor            std x   h
+fn LoadImageA               std h   h s x x x x
+fn LoadCursorFromFileA      std h   s
+fn LoadIconA                std h   h s
+fn GetSystemMetrics         std x   x
+fn PostQuitMessage          std v   x
+fn GetUpdateRect            std x   h oS:RECT x
+fn ValidateRect             std x   h S:RECT
+fn SetCapture               std h   h
+fn ReleaseCapture           std x
+fn SetCursor                std h   h
+fn GetDC                    std h   h
+fn ReleaseDC                std x   h h
+fn DrawTextA                std x   h s@3 x ioS:RECT x
+fn GetKeyboardType          std x   x
+fn IsWindow                 std x   h
+fn IsDialogMessageA         std x   h S:MSG
+fn TranslateMessage         std x   S:MSG
+fn DispatchMessageA         std x   S:MSG
+fn GetWindowRect            std x   h oS:RECT?
+fn SetCursorPos             std x   x x
+fn GetUpdateRgn             std x   h h x
+fn DialogBoxParamA          std x   h s h cb:dlgproc p
+fn DestroyWindow            std x   h
+fn SendMessageA             std x   h x p p
+fn SendDlgItemMessageA      std x   h x x p p
+fn SetDlgItemTextA          std x   h x s
+fn GetDlgItem               std h   h x
+fn SetFocus                 std h   h
+fn GetDlgItemTextA          std x   h x os@4 x
+fn RegisterClassA           std x   S:WNDCLASSA
+fn EndDialog                std x   h x
+fn FlashWindow              std x   h x
+fn SetTimer                 std x   h x x cb:timerproc
+fn ShowWindow               std x   h x
+fn CreateWindowExA          std h   x s s x x x x x h h h p
+fn DefWindowProcA           std x   h x p p
+fn PeekMessageA             std x   oS:MSG? h x x x
+fn SetWindowTextA           std x   h s
+fn KillTimer                std x   h x
+fn wsprintfA                cdecl x os s
+fn LoadCursorA              std h   h s
+fn CreateDialogParamA       std h   h s h cb:dlgproc p
+
+# ---------------------------------------------------------------- GDI32
+fn DeleteObject             std x   h
+fn CreateFontIndirectA      std h   S:LOGFONTA
+fn GetStockObject           std h   x
+fn SetTextColor             std x   h x
+fn SetBkColor               std x   h x
+fn SetBkMode                std x   h x
+fn TextOutA                 std x   h x x s@5 x
+fn SelectObject             std h   h h
+fn SetViewportOrgEx         std x   h x x oS:POINT
+fn SetSystemPaletteUse      std x   h x
+fn GetSystemPaletteEntries  std x   h x x ob@3x4
+fn SelectPalette            std h   h h x
+fn AnimatePalette           std x   h x x b@3x4
+fn SetDIBColorTable         std x   h x x b@3x4
+fn RealizePalette           std x   h
+fn GetBkMode                std x   h
+fn GetBkColor               std x   h
+fn GetTextColor             std x   h
+fn CreateCompatibleDC       std h   h
+fn DeleteDC                 std x   h
+fn CreateDIBSection         std h   h bmi@3 x oda@d2 h x
+fn StretchDIBits            std x   h x x x x x x x x b@d11 bmi@12 x x
+fn CreatePalette            std h   lpal
+fn GetSystemPaletteUse      std x   h
+fn BitBlt                   std x   h x x x x h x x x
+fn GetObjectA               std x   h x ox@2
+fn SetPixel                 std x   h x x x
+fn GdiFlush                 std x
+fn CreateRectRgn            std h   x x x x
+fn GetPixel                 std x   h x x
+fn GetRegionData            std x   h x ob@r
+fn GetDeviceCaps            std x   h x
+
+# ---------------------------------------------------------------- ADVAPI32
+fn RegFlushKey              std x   h
+fn RegDeleteKeyA            std x   h s
+fn RegOpenKeyExA            std x   h s x x odh?0
+fn RegCreateKeyExA          std x   h s x s x x p odh odx
+fn RegSetValueExA           std x   h s x x x@6 x
+fn GetUserNameA             std x   os iodx
+fn RegCloseKey              std x   h
+fn RegQueryValueExA         std x   h s p odx?0 ox@*6?0 iodx
+fn RegOpenKeyA              std x   h s odh?0
+
+# ---------------------------------------------------------------- comdlg32, SHELL32, ole32
+fn GetOpenFileNameA         std x   ioS:OPENFILENAMEA
+fn GetSaveFileNameA         std x   ioS:OPENFILENAMEA
+fn DragAcceptFiles          std v   h x
+fn Shell_NotifyIconA        std x   x p
+fn DragQueryFileA           std x   h x os@4 x
+fn CoCreateInstance         std x   g p x g dp
+fn CoInitialize             std x   p
+
+# ---------------------------------------------------------------- WINMM
+fn mmioSetInfo              std x   h p x
+fn timeSetEvent             std x   x x cb:timecb x x
+fn timeKillEvent            std x   x
+fn midiOutGetDevCapsA       std x   x oS:MIDIOUTCAPSA?0 x
+fn midiOutGetNumDevs        std x
+fn midiOutGetVolume         std x   h odx?0
+fn midiOutSetVolume         std x   h x
+fn mciSendStringA           std x   s os@3?0 x h
+fn mmioClose                std x   h x
+fn mmioAscend               std x   h p x
+fn mmioRead                 std x   h ob@r x
+fn mmioDescend              std x   h p p x
+fn mmioOpenA                std h   s p x
+fn mmioSeek                 std x   h x x
+fn timeGetTime              std x
+fn mmioAdvance              std x   h p x
+fn mmioGetInfo              std x   h p x
+fn mmioWrite                std x   h b@3 x
+fn mmioCreateChunk          std x   h p x
+fn timeBeginPeriod          std x   x
+fn timeEndPeriod            std x   x
+
+# ---------------------------------------------------------------- DirectX entry points
+fn DirectInputCreateA       std x   h x oI:IDirectInputA?0 p
+fn DPLAYX.dll#1             std x   g dp p
+fn DPLAYX.dll#2             std x   cb:dpenum p x
+fn DirectSoundCreate        std x   g odp?0 p
+fn DirectSoundEnumerateA    std x   cb:dsenum p
+fn DirectDrawEnumerateA     std x   cb:ddenum p
+fn DirectDrawEnumerateW     std x   cb:ddenum p
+fn DirectDrawCreate         std x   g oI:IDirectDraw?0 p
+
+# ---------------------------------------------------------------- COM interfaces (this = arg 1)
+iface IDirectDraw QueryInterface AddRef Release Compact CreateClipper CreatePalette CreateSurface DuplicateSurface EnumDisplayModes EnumSurfaces FlipToGDISurface GetCaps GetDisplayMode GetFourCCCodes GetGDISurface GetMonitorFrequency GetScanLine GetVerticalBlankStatus Initialize RestoreDisplayMode SetCooperativeLevel SetDisplayMode WaitForVerticalBlank
+fn IDirectDraw::QueryInterface         std x h g dp
+fn IDirectDraw::AddRef                 std x h
+fn IDirectDraw::Release                std x h
+fn IDirectDraw::Compact                std x h
+fn IDirectDraw::CreateClipper          std x h x oI:IDirectDrawClipper p
+fn IDirectDraw::CreatePalette          std x h x b@=1024 oI:IDirectDrawPalette p
+fn IDirectDraw::CreateSurface          std x h S:DDSURFACEDESC oI:IDirectDrawSurface p
+fn IDirectDraw::DuplicateSurface       std x h h oI:IDirectDrawSurface
+fn IDirectDraw::EnumDisplayModes       std x h x S:DDSURFACEDESC p cb:enummodes
+fn IDirectDraw::EnumSurfaces           std x h x S:DDSURFACEDESC p cb:enumsurf
+fn IDirectDraw::FlipToGDISurface       std x h
+fn IDirectDraw::GetCaps                std x h p p
+fn IDirectDraw::GetDisplayMode         std x h ioS:DDSURFACEDESC
+fn IDirectDraw::GetFourCCCodes         std x h iodx p
+fn IDirectDraw::GetGDISurface          std x h oI:IDirectDrawSurface
+fn IDirectDraw::GetMonitorFrequency    std x h odx
+fn IDirectDraw::GetScanLine            std x h odx
+fn IDirectDraw::GetVerticalBlankStatus std x h odx
+fn IDirectDraw::Initialize             std x h g
+fn IDirectDraw::RestoreDisplayMode     std x h
+fn IDirectDraw::SetCooperativeLevel    std x h h x
+fn IDirectDraw::SetDisplayMode         std x h x x x
+fn IDirectDraw::WaitForVerticalBlank   std x h x h
+
+iface IDirectDrawSurface QueryInterface AddRef Release AddAttachedSurface AddOverlayDirtyRect Blt BltBatch BltFast DeleteAttachedSurface EnumAttachedSurfaces EnumOverlayZOrders Flip GetAttachedSurface GetBltStatus GetCaps GetClipper GetColorKey GetDC GetFlipStatus GetOverlayPosition GetPalette GetPixelFormat GetSurfaceDesc Initialize IsLost Lock ReleaseDC Restore SetClipper SetColorKey SetOverlayPosition SetPalette Unlock UpdateOverlay UpdateOverlayDisplay UpdateOverlayZOrder
+fn IDirectDrawSurface::QueryInterface        std x h g dp
+fn IDirectDrawSurface::AddRef                std x h
+fn IDirectDrawSurface::Release               std x h
+fn IDirectDrawSurface::AddAttachedSurface    std x h h
+fn IDirectDrawSurface::AddOverlayDirtyRect   std x h S:RECT
+fn IDirectDrawSurface::Blt                   std x h S:RECT h S:RECT x p
+fn IDirectDrawSurface::BltBatch              std x h p x x
+fn IDirectDrawSurface::BltFast               std x h x x h S:RECT x
+fn IDirectDrawSurface::DeleteAttachedSurface std x h x h
+fn IDirectDrawSurface::EnumAttachedSurfaces  std x h p cb:enumsurf
+fn IDirectDrawSurface::EnumOverlayZOrders    std x h x p cb:enumsurf
+fn IDirectDrawSurface::Flip                  std x h h x
+fn IDirectDrawSurface::GetAttachedSurface    std x h x@=4 oI:IDirectDrawSurface
+fn IDirectDrawSurface::GetBltStatus          std x h x
+fn IDirectDrawSurface::GetCaps               std x h ox@=4
+fn IDirectDrawSurface::GetClipper            std x h oI:IDirectDrawClipper
+fn IDirectDrawSurface::GetColorKey           std x h x ox@=8
+fn IDirectDrawSurface::GetDC                 std x h odh
+fn IDirectDrawSurface::GetFlipStatus         std x h x
+fn IDirectDrawSurface::GetOverlayPosition    std x h odx odx
+fn IDirectDrawSurface::GetPalette            std x h oI:IDirectDrawPalette
+fn IDirectDrawSurface::GetPixelFormat        std x h ox@=32
+fn IDirectDrawSurface::GetSurfaceDesc        std x h ioS:DDSURFACEDESC
+fn IDirectDrawSurface::Initialize            std x h h S:DDSURFACEDESC
+fn IDirectDrawSurface::IsLost                std x h
+fn IDirectDrawSurface::Lock                  std x h S:RECT ioS:DDSURFACEDESC x h
+fn IDirectDrawSurface::ReleaseDC             std x h h
+fn IDirectDrawSurface::Restore               std x h
+fn IDirectDrawSurface::SetClipper            std x h h
+fn IDirectDrawSurface::SetColorKey           std x h x x@=8
+fn IDirectDrawSurface::SetOverlayPosition    std x h x x
+fn IDirectDrawSurface::SetPalette            std x h h
+fn IDirectDrawSurface::Unlock                std x h p
+fn IDirectDrawSurface::UpdateOverlay         std x h S:RECT h S:RECT x p
+fn IDirectDrawSurface::UpdateOverlayDisplay  std x h x
+fn IDirectDrawSurface::UpdateOverlayZOrder   std x h x h
+
+iface IDirectDrawPalette QueryInterface AddRef Release GetCaps GetEntries Initialize SetEntries
+fn IDirectDrawPalette::QueryInterface  std x h g dp
+fn IDirectDrawPalette::AddRef          std x h
+fn IDirectDrawPalette::Release         std x h
+fn IDirectDrawPalette::GetCaps         std x h odx
+fn IDirectDrawPalette::GetEntries      std x h x x x ob@4x4
+fn IDirectDrawPalette::Initialize      std x h h x p
+fn IDirectDrawPalette::SetEntries      std x h x x x b@4x4
+
+iface IDirectDrawClipper QueryInterface AddRef Release GetClipList GetHWnd Initialize IsClipListChanged SetClipList SetHWnd
+fn IDirectDrawClipper::QueryInterface    std x h g dp
+fn IDirectDrawClipper::AddRef            std x h
+fn IDirectDrawClipper::Release           std x h
+fn IDirectDrawClipper::GetClipList       std x h S:RECT p iodx
+fn IDirectDrawClipper::GetHWnd           std x h odh
+fn IDirectDrawClipper::Initialize        std x h h x
+fn IDirectDrawClipper::IsClipListChanged std x h odx
+fn IDirectDrawClipper::SetClipList       std x h p x
+fn IDirectDrawClipper::SetHWnd           std x h x h
+
+iface IDirectInputA QueryInterface AddRef Release CreateDevice EnumDevices GetDeviceStatus RunControlPanel Initialize
+fn IDirectInputA::QueryInterface   std x h g dp
+fn IDirectInputA::AddRef           std x h
+fn IDirectInputA::Release          std x h
+fn IDirectInputA::CreateDevice     std x h g oI:IDirectInputDeviceA?0 p
+fn IDirectInputA::EnumDevices      std x h x cb:dienum p x
+fn IDirectInputA::GetDeviceStatus  std x h g
+fn IDirectInputA::RunControlPanel  std x h h x
+fn IDirectInputA::Initialize       std x h h x
+
+iface IDirectInputDeviceA QueryInterface AddRef Release GetCapabilities EnumObjects GetProperty SetProperty Acquire Unacquire GetDeviceState GetDeviceData SetDataFormat SetEventNotification SetCooperativeLevel GetObjectInfo GetDeviceInfo RunControlPanel Initialize
+fn IDirectInputDeviceA::QueryInterface       std x h g dp
+fn IDirectInputDeviceA::AddRef               std x h
+fn IDirectInputDeviceA::Release              std x h
+fn IDirectInputDeviceA::GetCapabilities      std x h p
+fn IDirectInputDeviceA::EnumObjects          std x h cb:dienumobj p x
+fn IDirectInputDeviceA::GetProperty          std x h p p
+fn IDirectInputDeviceA::SetProperty          std x h p p
+fn IDirectInputDeviceA::Acquire              std x h
+fn IDirectInputDeviceA::Unacquire            std x h
+fn IDirectInputDeviceA::GetDeviceState       std x h x ob@2
+fn IDirectInputDeviceA::GetDeviceData        std x h x ob@*4x16 iodx x
+fn IDirectInputDeviceA::SetDataFormat        std x h S:DIDATAFORMAT
+fn IDirectInputDeviceA::SetEventNotification std x h h
+fn IDirectInputDeviceA::SetCooperativeLevel  std x h h x
+fn IDirectInputDeviceA::GetObjectInfo        std x h p x x
+fn IDirectInputDeviceA::GetDeviceInfo        std x h p
+fn IDirectInputDeviceA::RunControlPanel      std x h h x
+fn IDirectInputDeviceA::Initialize           std x h h x g

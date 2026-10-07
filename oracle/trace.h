@@ -2,7 +2,7 @@
  * Every record is four little-endian uint32: kind, a, b, c. */
 #ifndef RCT_TRACE_H
 #define RCT_TRACE_H
-#define TRACE_VERSION 1
+#define TRACE_VERSION 3   /* 2: TR_REGS_IN3, TR_INJ_IN3; 3: TR_BUILD */
 enum {
     TR_HEADER   = 0x01, /* version, realtime flag, time quantum                          */
     TR_FRAME    = 0x02, /* frame number, virtual clock, ticks so far                     */
@@ -17,7 +17,9 @@ enum {
     TR_REGS_OUT = 0x0B, /* eax, ebx, ecx */
     TR_REGS_OUT2= 0x0C, /* edx, esi, edi */
     TR_REGS_OUT3= 0x0D, /* ebp, eflags, 0 */
-    TR_INPUT    = 0x0E, /* tick, channel (1 key, 2 cursor, 3 poke, 4 mouse), value      */
+    TR_INPUT    = 0x0E, /* tick, channel, value: 1 key, 2 cursor, 3 poke, 4 mouse,
+                           5 file (script line), 6 char (code), 7 dimouse (dx&0xFFF | (dy&0xFFF)<<12 |
+                           buttons<<24), 8 move (lParam: x | y<<16)                              */
     TR_LOAD     = 0x0F, /* tick, ok, frame */
     TR_MSG      = 0x10, /* tick, window message, wparam (delivered to the game)          */
     TR_MSG_DROP = 0x11, /* tick, window message (user input dropped by the pin)          */
@@ -29,5 +31,10 @@ enum {
     TR_INJ_IN2  = 0x17, /* edx, esi, edi  of an injected call */
     TR_MSTATE   = 0x18, /* tick, masked state hash lo, hi: as TR_STATE with OS-derived dwords
                            (heap/mapping addresses, handles; rcthook.c mask) hashed as 0       */
+    TR_REGS_IN3 = 0x19, /* ebp, eflags & 0xCD5, 0  of a game_do_command entry (after TR_REGS_IN2) */
+    TR_INJ_IN3  = 0x1A, /* ebp, eflags & 0xCD5, 0  of an injected call (after TR_INJ_IN2)        */
+    TR_BUILD    = 0x1B, /* build id lo, build id hi, producer (0 oracle, 1 lift host): the second
+                           record, after TR_HEADER. Oracle id: first 64 bits of the SHA-256 of
+                           the oracle sources (Makefile)                                       */
 };
 #endif

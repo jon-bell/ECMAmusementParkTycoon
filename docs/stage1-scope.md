@@ -117,6 +117,54 @@ read as 0. It is validated three ways:
 The Stage 0 gate now runs a layout-shifted copy of every case and requires `masked` to match.
 It passes on all 7 cases.
 
+#### M5 addendum (Stage 1, ORACLE INSTRUMENTS): the mask audited, `oracle/mask.h`
+
+The gate's layout-shift run of `heldout/tour-sc17-lightning-peaks` diverged on `masked` at tick
+10647 with identical RNG: the bits pointer of a second drawing context (`0x9A012C`) was not
+masked. The tick-1 dumps used above could not see it, because the game fills that context only
+when zooming. The mask was therefore re-derived, dynamically at every tick and statically.
+
+- **Single source of truth.** `oracle/mask.h` lists the masked state, one `MASK_DWORD(addr)` or
+  `MASK_STRIDE(base, stride, count)` per line. `rcthook.c` includes it and the JS host parses it.
+  Masking is per byte: a masked byte reads as 0 inside its 32-bit hashed word. For the previous
+  (aligned) entries this gives the same hash values as before.
+- **Dynamic, phase 1** (`RCTHOOK_SPIKE=ptrscan`). Every tick, every state dword at every 2-byte
+  offset is checked (only changed words after the first tick). One whose value lies in OS memory
+  (mapped view, private allocation, another module's image, stack) is recorded. Runs: all 43 corpus
+  cases plus 18 UI/zoom/window/tour discovery scripts of the CORPUS workstream (`out/cw/scripts`),
+  each clean and with `heapshift=200003`: 122 runs. Union: 189,651 candidate addresses, most of
+  them game data that looks like a pointer by coincidence.
+- **Dynamic, phase 2** (`RCTHOOK_SPIKE=watch=LIST`). The same 61 scripts, clean and shifted, log
+  every change of every candidate at every tick. The game is deterministic and the RNG agrees, so
+  coincidental values have identical logs. A byte is layout-dependent iff its value differs between
+  the clean and the shifted log at the same logged change. `tools/watchdiff.c` also checks that the
+  two logs have the same (tick, address) sequence.
+  - Result (`tools/maskaudit.py diff`): 54,313 layout-dependent bytes in 38,360 ranges. 38,349
+    ranges are sprite-table entries; the other 11 are listed below. With the new entries, **0 bytes
+    are uncovered** by `mask.h`.
+- **Static.** Drawing contexts (bits pointer, then x, y, w, h, pitch, zoom as words) are passed to
+  the drawing routines in `edi`. Of the 59 DATASEG addresses the code loads into `edi` as an
+  immediate, exactly six are drawing contexts that hold DIB pointers at run time: `0x5F96C0`
+  (written directly), `0x5F96D0`, `0x99FB7C`, `0x99FB8C`, `0x99FE08` and `0x9A012C`. Every other
+  route from OS memory into game code goes through the glue in `.text`:
+  - the CSG1.DAT view comes only from the `MapViewOfFile` wrapper `0x4080E0` (sprite table,
+    `0x9A2008`–`0x9A2010`);
+  - game code calls `malloc` only through `0x404656`, whose single caller stores the result at
+    `0x628C44` (a 64 KiB buffer used by the map window).
+- **Handles** do not move under the original heapshift (it shifted kernel handles only).
+  `RCTHOOK_PERTURB=LoadCursorA:ret^2` (an API-trace experiment) changed the masked state from
+  tick 1. A dump diff placed the change in a table of 22 `HCURSOR`s at `0x9A1550`. `heapshift` now
+  also creates 3 windows, 5 cursors, 10 GDI objects and a DC before the game starts. A tick-5 dump
+  then differs from a clean one, outside the mask, only in that table. Since then the gate's
+  layout-shift runs check USER and GDI handles too.
+
+New entries: `0x9A012C`, `0x99FE08` (drawing-context bits), `0x628C44` (malloc'd buffer) and
+`0x9A1550 + 4·i`, i < 22 (cursor handles). The full list with the code addresses is `mask.h`.
+
+**Not covered:** pointers into OS memory that the corpus never produces at any tick, in code
+paths it never runs. The static argument above covers the drawing contexts and the malloc route;
+it does not cover a pointer computed some other way.
+
 ### M6. Memory model
 
 From `RCTHOOK_SPIKE=memmap` plus the API counts. Outside the image (`0x400000–0x9BD000`) the

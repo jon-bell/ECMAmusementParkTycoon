@@ -11,9 +11,11 @@ sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
   xvfb xauth x11-utils xdotool imagemagick \
   p7zip-full \
   gcc-mingw-w64-i686 binutils-mingw-w64-i686 make \
-  python3 python3-venv
+  python3 python3-venv \
+  nodejs
 # Analysis tools (disassembly helpers in tools/rctdis.py); kept out of the system Python.
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 python3 -m venv "$ROOT/.venv"
 "$ROOT/.venv/bin/pip" install -q capstone pefile
 wine --version
+nodejs --version   # the lift (Stage 1) runs on Ubuntu's Node 18

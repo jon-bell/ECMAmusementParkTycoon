@@ -23,8 +23,12 @@
  *                               script only (all zero by default).
  *   GetCursorPos / SetCursorPos fixed virtual cursor (script-controlled); SetCursorPos moves it.
  *   window procedure            mouse/keyboard window messages are dropped (logged).
+ *   PeekMessageA                MSG.time = virtual clock, MSG.pt = virtual cursor (Wine: real ones).
+ *   GetOpenFileNameA/GetSaveFileNameA  never shown: answered by the script's "file" action or cancelled.
  *   GetComputerName/GetUserName fixed strings. GlobalMemoryStatus, GetDiskFreeSpace fixed values.
+ *   GetEnvironmentStrings(W)    a fixed environment block (the real one varies with the run).
  *   FindFirstFile/FindNextFile  results sorted by name (directory order is filesystem-dependent),
+ *                               search handles 0x46490000 + 4*slot (lowest free slot),
  *                               timestamps fixed; on the CD drive D:, Windows-style 8.3 aliases
  *                               (the copy protection at 0x42F1D3 rejects Wine's hashed aliases).
  * Not pinned here but by the run environment (scripts/oracle-run.sh): a fresh copy of the
@@ -41,12 +45,16 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <mmsystem.h>
+#include <commdlg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include "trace.h"
 #include "spike.h"
+#ifndef ORACLE_BUILD_ID
+#define ORACLE_BUILD_ID 0ULL   /* set by the Makefile */
+#endif
 
 /* ---------------------------------------------------------------- binary addresses */
 #define A_RNG_STORE    0x5DF42Au   /* mov [srand1],eax  (eax = drawn value)            */
@@ -129,35 +137,46 @@ static int g_quitting;
 static int g_loading;                    /* a scenario load is in progress (it longjmps out) */
 
 /* ---------------------------------------------------------------- state hashing */
-/* State dwords that hold values derived from the OS rather than from the game: addresses of
- * memory Wine allocated or mapped, and handles. Measured by shifting the heap/mapping layout and
- * handle numbering (RCTHOOK_SPIKE=heapshift): across the whole corpus exactly these differ while
- * every RNG draw stays identical.
- *   0x8DC0B4 + 16*i, i < 38365  sprite table: pointer into the CSG1.DAT mapping (from CSG1I.DAT)
- *   0x5F96C0, 0x5F96D0          pointers into the screen DIB section
- *   0x99FB7C, 0x99FB8C          screen drawing context: DIB bits
- *   0x9A2008, 0x9A200C, 0x9A2010  CSG1.DAT mapping base and a transient OS address (tick 1)
- *   0x5F88A4                    file handle of the last scenario file opened */
-#define SPRITE_LO 0x8DC0B4u
-#define SPRITE_N  38365u
-static const uint32_t mask_single[] = {0x5F88A4, 0x5F96C0, 0x5F96D0, 0x99FB7C, 0x99FB8C, 0x9A2008, 0x9A200C, 0x9A2010};
-static int masked(uint32_t a)
+/* State bytes that hold values the OS chose (addresses of memory Wine allocated or mapped, handles):
+ * oracle/mask.h, shared with the JS host. They read as 0 in the masked hash. g_mask holds, per
+ * 32-bit word of the hashed ranges, the word's masked bits. */
+#define NW1 ((STATE_HI - STATE_LO + 3) / 4)
+#define NW2 ((STATE2_HI - STATE2_LO + 3) / 4)
+static uint32_t *g_mask;    /* at a fixed address Wine leaves free: a 4 MiB .bss or a heap block would
+                              move where Wine places the game's memory (DIB, CSG1 view, heaps) */
+static void mask_bytes(uint32_t a, uint32_t n)
 {
-    if (a >= SPRITE_LO && a < SPRITE_LO + 16 * SPRITE_N) return ((a - SPRITE_LO) & 15) == 0;
-    for (unsigned i = 0; i < sizeof mask_single / 4; i++) if (a == mask_single[i]) return 1;
-    return 0;
+    for (uint32_t b = a; b < a + n; b++) {
+        uint32_t i;
+        if (b >= STATE_LO && b < STATE_HI) i = (b - STATE_LO) / 4;
+        else if (b >= STATE2_LO && b < STATE2_HI) i = NW1 + (b - STATE2_LO) / 4;
+        else continue;
+        uint32_t base = b >= STATE2_LO ? STATE2_LO : STATE_LO;
+        g_mask[i] |= 0xFFu << (8 * ((b - base) & 3));
+    }
+}
+static uint32_t g_mask_dwords;
+static void mask_build(void)
+{
+    g_mask = VirtualAlloc((void *)0x3E000000, 4 * (NW1 + NW2), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!g_mask) { logf_("FATAL: mask table not allocatable at 0x3E000000\n"); TerminateProcess(GetCurrentProcess(), 3); }
+#define MASK_DWORD(a) do { mask_bytes((a), 4); g_mask_dwords++; } while (0);
+#define MASK_STRIDE(b, s, n) do { for (uint32_t i_ = 0; i_ < (uint32_t)(n); i_++) mask_bytes((b) + i_ * (s), 4); g_mask_dwords += (n); } while (0);
+#include "mask.h"
+#undef MASK_DWORD
+#undef MASK_STRIDE
 }
 
-/* FNV-1a over 32-bit words, 64-bit state: raw, and with masked dwords read as 0 */
+/* FNV-1a over 32-bit words, 64-bit state: raw, and with masked bytes read as 0 */
 static uint64_t hash_range(uint32_t lo, uint32_t hi, uint64_t *mh)
 {
     uint64_t h = 0xcbf29ce484222325ull, m = *mh;
     const uint32_t *p = (const uint32_t *)lo, *e = (const uint32_t *)(hi & ~3u);
-    int maybe = (hi > 0x5F88A4 && lo <= 0x9A2010);
-    for (; p < e; p++) {
+    const uint32_t *mk = g_mask + (lo >= STATE2_LO ? NW1 + (lo - STATE2_LO) / 4 : (lo - STATE_LO) / 4);
+    for (; p < e; p++, mk++) {
         uint32_t w = *p;
         h ^= w; h *= 0x100000001b3ull;
-        m ^= (maybe && masked((uint32_t)p)) ? 0 : w; m *= 0x100000001b3ull;
+        m ^= w & ~*mk; m *= 0x100000001b3ull;
     }
     for (const uint8_t *q = (const uint8_t *)e; q < (const uint8_t *)hi; q++) {
         h ^= *q; h *= 0x100000001b3ull; m ^= *q; m *= 0x100000001b3ull;
@@ -193,6 +212,7 @@ static void dump_state(const char *tag)
 
 /* ---------------------------------------------------------------- inline hooks */
 typedef void (__cdecl *hook_fn)(regs_t *);
+static uint32_t g_tick_disp;     /* where the tick hook's stub runs the displaced instruction */
 static uint8_t *g_stubs; static uint32_t g_stub_used;
 
 /* Patch `len` bytes at `addr` with a jmp to a stub that saves all registers and flags, calls
@@ -209,11 +229,15 @@ static void hook_at(uint32_t addr, uint32_t len, hook_fn fn)
     *p++ = 0x61;                                   /* popad */
     *p++ = 0x9D;                                   /* popfd */
     const uint8_t *o = (const uint8_t *)addr;
+    uint32_t disp = (uint32_t)p, reloc_ret = 0;
     if (o[0] == 0xE8) {                            /* relocate call rel32 */
         uint32_t target = addr + 5 + *(int32_t *)(o + 1);
         *p++ = 0xE8; *(int32_t *)p = (int32_t)(target - ((uint32_t)p + 4)); p += 4;
+        reloc_ret = (uint32_t)p;
         memcpy(p, o + 5, len - 5); p += len - 5;
     } else { memcpy(p, o, len); p += len; }
+    spike_add_hook(addr, len, disp, reloc_ret, reloc_ret ? addr + 5 : 0);
+    if (addr == A_TICK) g_tick_disp = disp;
     *p++ = 0xE9; *(int32_t *)p = (int32_t)((addr + len) - ((uint32_t)p + 4)); p += 4;
     g_stub_used += (uint32_t)(p - s + 15) & ~15u;
 
@@ -235,7 +259,7 @@ static void patch_iat(uint32_t slot, void *fn, void **orig)
 
 /* ---------------------------------------------------------------- script */
 enum { W_FRAME, W_TICK };
-enum { A_QUIT, A_CMD, A_LOAD, A_KEY, A_CURSOR, A_DUMP, A_CALL, A_POKE, A_SHOT, A_FB, A_MOUSE };
+enum { A_QUIT, A_CMD, A_LOAD, A_KEY, A_CURSOR, A_DUMP, A_CALL, A_POKE, A_SHOT, A_FB, A_MOUSE, A_FILE, A_CHAR, A_DIMOUSE, A_MOVE };
 typedef struct {
     int when_kind; uint32_t when; int action; regs_t r; uint32_t arg, arg2; char text[MAX_PATH];
     int done; int line; int rel;
@@ -244,6 +268,11 @@ static uint32_t g_load_frame;            /* frame at which the last scenario loa
 static action_t *g_act; static int g_nact, g_next_act;
 
 static uint8_t g_keys[256];                       /* DirectInput keyboard state */
+static int32_t g_dm_dx, g_dm_dy; static uint32_t g_dm_buttons;   /* DirectInput mouse (dimouse) */
+static char g_file_answer[MAX_PATH]; static int g_file_pending;  /* next file dialog (file) */
+typedef struct { uint32_t m, w, l; } qmsg_t;
+static qmsg_t g_charq[64]; static uint32_t g_char_head, g_nchar;  /* messages posted by the script */
+static HWND g_hwnd;
 static LONG g_cur_x = 1000, g_cur_y = 740;        /* virtual cursor (screen coordinates) */
 
 static int parse_reg(const char *tok, regs_t *r)
@@ -259,6 +288,7 @@ static int parse_reg(const char *tok, regs_t *r)
 static void fatal(const char *why, int line)
 {
     logf_("FATAL: %s (script line %d)\n", why, line);
+    spike_abort();
     if (g_log != INVALID_HANDLE_VALUE) CloseHandle(g_log);
     TerminateProcess(GetCurrentProcess(), 3);
 }
@@ -266,7 +296,12 @@ static void load_script(const char *path)
 {
     FILE *f = fopen(path, "r");
     if (!f) { logf_("script: cannot open %s\n", path); fatal("script unreadable", 0); }
-    char line[1024]; int ln = 0, cap = 0;
+    char line[1024]; int ln = 0;
+    /* actions live at a fixed address, not in the DLL's heap: a long script would otherwise grow
+     * that heap before the game starts and move where Wine places the game's memory */
+    g_act = VirtualAlloc((void *)0x3D000000, 0x01000000, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!g_act) fatal("action arena not allocatable at 0x3D000000", 0);
+    int cap = 0x01000000 / sizeof *g_act;
     while (fgets(line, sizeof line, f)) {
         ln++;
         char *c = strchr(line, '#'); if (c) *c = 0;
@@ -279,9 +314,16 @@ static void load_script(const char *path)
             logf_("script:%d: seed: virtual clock starts at %u\n", ln, g_vt);
             continue;
         }
+        if (!strcmp(tok[0], "quantum") && nt >= 2) {
+            /* virtual ms per time query (overrides RCTHOOK_QUANTUM); recorded in TR_HEADER */
+            g_quantum = strtoul(tok[1], NULL, 0);
+            if (!g_quantum) fatal("quantum must be at least 1", ln);
+            logf_("script:%d: quantum %u\n", ln, g_quantum);
+            continue;
+        }
         if (nt < 3) fatal("action too short", ln);
         if (strcmp(tok[0], "tick") && strcmp(tok[0], "frame")) fatal("time must be 'tick N' or 'frame [+]N'", ln);
-        if (g_nact == cap) { cap = cap ? cap * 2 : 64; g_act = realloc(g_act, cap * sizeof *g_act); }
+        if (g_nact == cap) fatal("script has too many actions", ln);
         action_t *a = &g_act[g_nact]; memset(a, 0, sizeof *a); a->line = ln;
         a->when_kind = !strcmp(tok[0], "tick") ? W_TICK : W_FRAME;
         a->rel = tok[1][0] == '+';               /* frame +N: N frames after the last load */
@@ -305,6 +347,16 @@ static void load_script(const char *path)
         } else if (!strcmp(v, "mouse") && nt >= 6) {
             /* mouse <x> <y> <event>: event 1 left down, 2 right down, 3 left up, 4 right up */
             a->action = A_MOUSE; a->arg = strtoul(tok[3], NULL, 0); a->arg2 = strtoul(tok[4], NULL, 0);
+            a->r.eax = strtoul(tok[5], NULL, 0);
+        } else if (!strcmp(v, "file") && nt >= 4) {
+            a->action = A_FILE; snprintf(a->text, sizeof a->text, "%s", tok[3]);
+        } else if (!strcmp(v, "char") && nt >= 4) {
+            a->action = A_CHAR;
+            a->arg = strlen(tok[3]) == 1 ? (uint8_t)tok[3][0] : strtoul(tok[3], NULL, 0);
+        } else if (!strcmp(v, "move") && nt >= 5) {
+            a->action = A_MOVE; a->arg = strtoul(tok[3], NULL, 0); a->arg2 = strtoul(tok[4], NULL, 0);
+        } else if (!strcmp(v, "dimouse") && nt >= 6) {
+            a->action = A_DIMOUSE; a->arg = (uint32_t)strtol(tok[3], NULL, 0); a->arg2 = (uint32_t)strtol(tok[4], NULL, 0);
             a->r.eax = strtoul(tok[5], NULL, 0);
         } else if (!strcmp(v, "poke") && nt >= 5) {
             a->action = A_POKE; a->arg = strtoul(tok[3], NULL, 0); a->arg2 = strtoul(tok[4], NULL, 0);
@@ -349,7 +401,6 @@ static void fb_dump(void)
 }
 
 /* Debug aid, not part of any projection: the game window as a 24-bit BMP. */
-static HWND g_hwnd;
 static void screenshot(void)
 {
     if (!g_hwnd) return;
@@ -400,6 +451,26 @@ static void run_actions(int kind)
             trec(TR_INPUT, g_tick, 4, a->arg | a->arg2 << 16 | a->r.eax << 28);
             break;
         }
+        case A_FILE:     /* the answer of the next file dialog */
+            snprintf(g_file_answer, sizeof g_file_answer, "%s", a->text); g_file_pending = 1;
+            trec(TR_INPUT, g_tick, 5, a->line);
+            logf_("line %d: next file dialog answers %s\n", a->line, a->text);
+            break;
+        case A_CHAR:     /* WM_CHAR through the message queue, as a key press would deliver it */
+        case A_MOVE: {   /* WM_MOUSEMOVE (client coordinates, no buttons): the game's hover position */
+            qmsg_t q = a->action == A_CHAR ? (qmsg_t){WM_CHAR, a->arg, 1}
+                                           : (qmsg_t){WM_MOUSEMOVE, 0, (a->arg & 0xFFFF) | (a->arg2 & 0xFFFF) << 16};
+            if (!g_hwnd || g_nchar >= 64) { logf_("line %d: message %#x not delivered (no window or queue full)\n", a->line, q.m); break; }
+            g_charq[(g_char_head + g_nchar++) & 63] = q;
+            PostMessageA(g_hwnd, q.m, q.w, q.l);
+            if (a->action == A_CHAR) trec(TR_INPUT, g_tick, 6, a->arg);
+            else { trec(TR_INPUT, g_tick, 8, q.l); g_cur_x = a->arg; g_cur_y = a->arg2; }
+            break;
+        }
+        case A_DIMOUSE:  /* DirectInput mouse: deltas add up until the game reads them; buttons persist */
+            g_dm_dx += (int32_t)a->arg; g_dm_dy += (int32_t)a->arg2; g_dm_buttons = a->r.eax & 0xF;
+            trec(TR_INPUT, g_tick, 7, (a->arg & 0xFFF) | (a->arg2 & 0xFFF) << 12 | g_dm_buttons << 24);
+            break;
         case A_CURSOR: g_cur_x = a->arg; g_cur_y = a->arg2;
             trec(TR_INPUT, g_tick, 2, a->arg | a->arg2 << 16); break;
         case A_POKE: *(uint8_t *)a->arg ^= (uint8_t)a->arg2;   /* fault injection for gate self-tests */
@@ -408,10 +479,11 @@ static void run_actions(int kind)
             /* What the scenario-select window does (0x4304A7): ax = scenario number, call the
              * new-game routine from inside the frame. On success it resets esp to the frame's
              * saved esp and returns to the main loop, so this call does not return here. */
-            regs_t r; memset(&r, 0, sizeof r); r.eax = a->arg;
+            regs_t r; memset(&r, 0, sizeof r); r.eax = a->arg; r.eflags = 0x202;
             trec(TR_LOAD, g_tick, a->arg, g_frame);
             logf_("load scenario %u at frame %u tick %u\n", a->arg, g_frame, g_tick);
             g_loading = 1;
+            spike_guest_call(A_NEW_GAME, 0);
             call_asm(A_NEW_GAME, &r);
             g_loading = 0;
             trec(TR_NOTE, g_tick, 2, a->arg);
@@ -423,13 +495,20 @@ static void run_actions(int kind)
             uint32_t target = A_DO_COMMAND;
             if (a->action == A_CMD) r.esi = a->arg; else target = a->arg;
             trec(TR_INJECT, g_tick, a->action == A_CMD ? a->arg : target, a->line);
+            /* flags at entry are defined (CF PF AF ZF SF DF OF from the script, default 0; IF set) */
+            r.eflags = (r.eflags & 0xCD5u) | 0x202u;
             trec(TR_INJ_IN, r.eax, r.ebx, r.ecx); trec(TR_INJ_IN2, r.edx, r.esi, r.edi);
+            trec(TR_INJ_IN3, r.ebp, r.eflags & 0xCD5u, 0);
+            spike_guest_call(target, 0);
             call_asm(target, &r);
             trec(TR_REGS_OUT, r.eax, r.ebx, r.ecx); trec(TR_REGS_OUT2, r.edx, r.esi, r.edi);
             trec(TR_REGS_OUT3, r.ebp, r.eflags, 0);
             logf_("line %d %s %#x at frame %u tick %u -> ebx=%#x\n", a->line,
                   a->action == A_CMD ? "cmd" : "call", a->action == A_CMD ? a->arg : target,
                   g_frame, g_tick, r.ebx);
+            if (a->action == A_CMD && r.ebx == 0x80000000u)   /* the game's error message (string id) */
+                logf_("line %d cmd %#x failed: error string id [0x991EFC] = %#x\n", a->line, a->arg,
+                      *(uint16_t *)0x991EFC);
             break;
         }
         }
@@ -446,10 +525,11 @@ static void __cdecl h_rng(regs_t *r)
 static void __cdecl h_tick(regs_t *r)
 {
     g_tick++;
-    spike_tick(&r->eflags, g_tick);
+    spike_tick((uint32_t *)r, g_tick, A_TICK, g_tick_disp);
     trec(TR_TICK, g_tick, *(uint32_t *)A_SRAND0, *(uint32_t *)A_SRAND1);
     record_state(TR_STATE);
     run_actions(W_TICK);
+    spike_tick_end((uint32_t *)r, g_tick_disp);
 }
 static void __cdecl h_frame(regs_t *r)
 {
@@ -483,6 +563,7 @@ static void __cdecl h_command(regs_t *r)
     if (caller < 0x401000 || caller >= 0x9BD000) caller = 0xFFFFFFFF;   /* injected by the script */
     trec(TR_COMMAND, g_tick, r->esi | (r->ebx & 0xff) << 8 | *(uint8_t *)0x5F4A6A << 16, caller);
     trec(TR_REGS_IN, r->eax, r->ebx, r->ecx); trec(TR_REGS_IN2, r->edx, r->esi, r->edi);
+    trec(TR_REGS_IN3, r->ebp, r->eflags & 0xCD5u, 0);   /* handlers receive ebp too */
 }
 
 /* ---------------------------------------------------------------- OS pins */
@@ -509,6 +590,16 @@ static BOOL WINAPI p_SetCursorPos(int x, int y)
     if (g_passthrough) return SetCursorPos(x, y);
     g_cur_x = x; g_cur_y = y; return TRUE;
 }
+/* environment: the process environment differs between runs (run directory, RCTHOOK_* settings,
+ * the gate's padding); the game sees this fixed block instead. The hook reads the real one. */
+#define ENV_BLOCK "COMSPEC=C:\\windows\\system32\\cmd.exe\0PATH=C:\\windows\\system32;C:\\windows\0" \
+                  "SystemRoot=C:\\windows\0TEMP=C:\\windows\\temp\0TMP=C:\\windows\\temp\0windir=C:\\windows\0"
+static char g_envA[] = ENV_BLOCK;            /* the literal's own NUL terminates the block */
+static WCHAR g_envW[] = L"" ENV_BLOCK;
+static LPCH WINAPI p_GetEnvironmentStrings(void) { return g_realtime ? GetEnvironmentStrings() : g_envA; }
+static LPWCH WINAPI p_GetEnvironmentStringsW(void) { return g_realtime ? GetEnvironmentStringsW() : g_envW; }
+static BOOL WINAPI p_FreeEnvironmentStringsA(LPCH p) { return p == g_envA ? TRUE : FreeEnvironmentStringsA(p); }
+static BOOL WINAPI p_FreeEnvironmentStringsW(LPWCH p) { return p == g_envW ? TRUE : FreeEnvironmentStringsW(p); }
 static BOOL WINAPI p_GetComputerNameA(LPSTR b, LPDWORD n) { strcpy(b, "ORACLE"); *n = 6; return TRUE; }
 static BOOL WINAPI p_GetUserNameA(LPSTR b, LPDWORD n) { strcpy(b, "oracle"); *n = 7; return TRUE; }
 static void WINAPI p_GlobalMemoryStatus(LPMEMORYSTATUS m)
@@ -551,6 +642,8 @@ static BOOL (WINAPI *r_PeekMessageA)(LPMSG, HWND, UINT, UINT, UINT);
 static BOOL WINAPI p_PeekMessageA(LPMSG m, HWND h, UINT lo, UINT hi, UINT rm)
 {
     BOOL got = r_PeekMessageA(m, h, lo, hi, rm);
+    /* Wine stamps messages with the real tick count and the real cursor: give the virtual ones */
+    if (got && !g_realtime) { m->time = g_vt; if (!g_passthrough) { m->pt.x = g_cur_x; m->pt.y = g_cur_y; } }
     if (!got && !g_realtime && g_timer_period && (int32_t)(g_vt - g_timer_due) >= 0) {
         memset(m, 0, sizeof *m);
         m->hwnd = g_timer_hwnd; m->message = WM_TIMER; m->wParam = g_timer_id; m->time = g_vt;
@@ -579,13 +672,21 @@ static LRESULT CALLBACK filt_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
         if (m == WM_RBUTTONDOWN) g_pt_buttons |= 2;
         if (m == WM_RBUTTONUP) g_pt_buttons &= ~2;
     }
-    if (is_input_msg(m) && !g_passthrough) {
+    if (g_nchar && g_charq[g_char_head & 63].m == m && g_charq[g_char_head & 63].w == (uint32_t)w &&
+        g_charq[g_char_head & 63].l == (uint32_t)l) {
+        g_char_head++; g_nchar--;           /* posted by a script "char"/"move" action: deliver it */
+    } else if (is_input_msg(m) && !g_passthrough) {
         trec(TR_MSG_DROP, g_tick, m, 0);
+        if (g_apitrace_on) apitrace_wndproc_drop(m, w, l);
         return DefWindowProcA(h, m, w, l);
     }
     if (m != WM_TIMER) trec(TR_MSG, g_tick, m, (uint32_t)w);
     logf_("msg %#x w=%#lx l=%#lx frame %u\n", m, (unsigned long)w, (unsigned long)l, g_frame);
-    return CallWindowProcA(g_wndproc, h, m, w, l);
+    if (g_apitrace_on) apitrace_wndproc_enter((uint32_t)g_wndproc, (uint32_t)h, m, w, l);
+    spike_guest_call((uint32_t)g_wndproc, 1);
+    LRESULT res = CallWindowProcA(g_wndproc, h, m, w, l);
+    if (g_apitrace_on) apitrace_wndproc_leave((uint32_t)res);
+    return res;
 }
 static ATOM WINAPI p_RegisterClassA(const WNDCLASSA *wc)
 {
@@ -597,6 +698,11 @@ static ATOM WINAPI p_RegisterClassA(const WNDCLASSA *wc)
 
 /* sorted directory enumeration */
 typedef struct { WIN32_FIND_DATAA *e; int n, i; } findset_t;
+#define FIND_BASE 0x46490000u      /* search handles: FIND_BASE + 4*slot, lowest free slot */
+#define MAX_FIND 16
+#define FIND_CAP 512
+static findset_t *g_find[MAX_FIND], g_findsets[MAX_FIND];
+static WIN32_FIND_DATAA *g_findpool;       /* MAX_FIND * FIND_CAP entries at 0x3C000000 */
 static int cmp_find(const void *a, const void *b)
 {
     return strcmp(((const WIN32_FIND_DATAA *)a)->cFileName, ((const WIN32_FIND_DATAA *)b)->cFileName);
@@ -641,10 +747,17 @@ static HANDLE WINAPI p_FindFirstFileA(LPCSTR pat, LPWIN32_FIND_DATAA out)
     logf_("FindFirstFileA(%s) frame %u -> %s [%s]\n", pat, g_frame,
           h == INVALID_HANDLE_VALUE ? "(none)" : d.cFileName, h == INVALID_HANDLE_VALUE ? "" : d.cAlternateFileName);
     if (h == INVALID_HANDLE_VALUE) return h;
-    findset_t *s = calloc(1, sizeof *s); int cap = 0;
+    /* result sets live in a fixed pool, not the DLL's heap (heap growth would move Wine's layout) */
+    int k = 0;
+    while (k < MAX_FIND && g_find[k]) k++;
+    if (k == MAX_FIND || !g_findpool) {
+        FindClose(h); logf_("FindFirstFileA: too many open searches\n"); SetLastError(ERROR_NO_MORE_FILES);
+        return INVALID_HANDLE_VALUE;
+    }
+    findset_t *s = &g_findsets[k]; s->n = 0; s->i = 0; s->e = g_findpool + k * FIND_CAP;
     do {
-        if (s->n == cap) { cap = cap ? cap * 2 : 32; s->e = realloc(s->e, cap * sizeof *s->e); }
-        s->e[s->n++] = d;
+        if (s->n < FIND_CAP) s->e[s->n++] = d;
+        else { logf_("FindFirstFileA(%s): more than %d entries, rest dropped\n", pat, FIND_CAP); break; }
     } while (FindNextFileA(h, &d));
     FindClose(h);
     qsort(s->e, s->n, sizeof *s->e, cmp_find);
@@ -655,15 +768,29 @@ static HANDLE WINAPI p_FindFirstFileA(LPCSTR pat, LPWIN32_FIND_DATAA out)
     if ((pat[0] == 'D' || pat[0] == 'd') && pat[1] == ':')
         for (int i = 0; i < s->n; i++) cd_alias(&s->e[i]);
     put_find(out, &s->e[0]); s->i = 1;
-    return (HANDLE)s;
+    /* the game keeps the handle in its state (0x5F9427): numbered handles, not an address */
+    g_find[k] = s;
+    return (HANDLE)(FIND_BASE + 4u * k);
+}
+static findset_t *find_of(HANDLE h)
+{
+    uint32_t k = ((uint32_t)h - FIND_BASE) / 4;
+    return ((uint32_t)h - FIND_BASE) % 4 == 0 && k < MAX_FIND ? g_find[k] : NULL;
 }
 static BOOL WINAPI p_FindNextFileA(HANDLE h, LPWIN32_FIND_DATAA out)
 {
-    findset_t *s = (findset_t *)h;
+    findset_t *s = find_of(h);
+    if (!s) { SetLastError(ERROR_INVALID_HANDLE); return FALSE; }
     if (s->i >= s->n) { SetLastError(ERROR_NO_MORE_FILES); return FALSE; }
     put_find(out, &s->e[s->i++]); return TRUE;
 }
-static BOOL WINAPI p_FindClose(HANDLE h) { findset_t *s = (findset_t *)h; free(s->e); free(s); return TRUE; }
+static BOOL WINAPI p_FindClose(HANDLE h)
+{
+    findset_t *s = find_of(h);
+    if (!s) { SetLastError(ERROR_INVALID_HANDLE); return FALSE; }
+    g_find[((uint32_t)h - FIND_BASE) / 4] = NULL;
+    return TRUE;
+}
 
 /* heuristic backtrace for discovery logs: stack words that are return addresses into the game */
 static void log_backtrace(void)
@@ -688,6 +815,7 @@ static void dialog_fatal(const char *what, const char *text)
 {
     logf_("FATAL: %s: %s (frame %u tick %u)\n", what, text ? text : "", g_frame, g_tick);
     log_backtrace();
+    spike_abort();
     tflush();
     if (g_log != INVALID_HANDLE_VALUE) CloseHandle(g_log);
     TerminateProcess(GetCurrentProcess(), 4);
@@ -703,10 +831,38 @@ static INT_PTR WINAPI p_DialogBoxParamA(HINSTANCE i, LPCSTR tmpl, HWND h, DLGPRO
     snprintf(b, sizeof b, "template %s%u", HIWORD(tmpl) ? "" : "#", HIWORD(tmpl) ? 0 : LOWORD(tmpl));
     dialog_fatal("DialogBoxParamA", HIWORD(tmpl) ? tmpl : b); return 0;
 }
+/* Common file dialogs are modal: never open one. A script "file <name>" action answers the next
+ * one with <game directory>\Saved Games\<name>; without one the dialog is cancelled. */
+static BOOL file_dialog(LPOPENFILENAMEA o, const char *what)
+{
+    logf_("%s: title %s initial dir %s (frame %u tick %u)\n", what, o && o->lpstrTitle ? o->lpstrTitle : "-",
+          o && o->lpstrInitialDir ? o->lpstrInitialDir : "-", g_frame, g_tick);
+    if (!g_file_pending || !o || !o->lpstrFile) {
+        logf_("%s: no script answer: cancelled\n", what); trec(TR_NOTE, g_tick, 4, 0); return FALSE;
+    }
+    g_file_pending = 0;
+    char dir[MAX_PATH], path[MAX_PATH];
+    GetModuleFileNameA(NULL, dir, sizeof dir);
+    char *bs = strrchr(dir, '\\'); if (bs) *bs = 0;
+    int n = snprintf(path, sizeof path, "%s\\Saved Games\\%s", dir, g_file_answer);
+    if (n < 0 || (DWORD)n + 1 > o->nMaxFile) { logf_("%s: answer too long\n", what); trec(TR_NOTE, g_tick, 4, 0); return FALSE; }
+    strcpy(o->lpstrFile, path);
+    o->nFileOffset = (WORD)(n - strlen(g_file_answer));
+    const char *dot = strrchr(g_file_answer, '.');
+    o->nFileExtension = dot ? (WORD)(o->nFileOffset + (dot - g_file_answer) + 1) : 0;
+    if (o->lpstrFileTitle && o->nMaxFileTitle > strlen(g_file_answer)) strcpy(o->lpstrFileTitle, g_file_answer);
+    logf_("%s: answered %s\n", what, path);
+    trec(TR_NOTE, g_tick, 4, 1);
+    return TRUE;
+}
+static BOOL WINAPI p_GetOpenFileNameA(LPOPENFILENAMEA o) { return file_dialog(o, "GetOpenFileNameA"); }
+static BOOL WINAPI p_GetSaveFileNameA(LPOPENFILENAMEA o) { return file_dialog(o, "GetSaveFileNameA"); }
+
 static HANDLE WINAPI p_CreateFileA(LPCSTR n, DWORD acc, DWORD sh, LPSECURITY_ATTRIBUTES sa, DWORD cd, DWORD fl, HANDLE t)
 {
     HANDLE h = CreateFileA(n, acc, sh, sa, cd, fl, t);
     uint32_t ret = (uint32_t)__builtin_return_address(0);
+    ret = apitrace_game_ret(ret);      /* returning through the register pin's trampoline */
     logf_("CreateFileA(%s, %#lx, disp %lu) from %#x frame %u -> %p\n", n, acc, cd, ret, g_frame, h);
     if (g_frame > 1) log_backtrace();
     trec(TR_FILE, g_tick, ret, h != INVALID_HANDLE_VALUE);
@@ -736,6 +892,10 @@ static HRESULT WINAPI d_GetDeviceState(fakedev_t *t, DWORD n, void *buf)
     memset(buf, 0, n);
     if (t->kind == 0) memcpy(buf, g_keys, n < 256 ? n : 256);
     if (t->kind == 1 && g_passthrough) return (HRESULT)0x8007000C;  /* discovery: use window messages */
+    if (t->kind == 1 && n >= 16) {      /* DIMOUSESTATE: lX, lY, lZ, rgbButtons[4] */
+        int32_t *m = buf; m[0] = g_dm_dx; m[1] = g_dm_dy; g_dm_dx = g_dm_dy = 0;
+        for (int i = 0; i < 4; i++) ((uint8_t *)buf)[12 + i] = (g_dm_buttons >> i & 1) ? 0x80 : 0;
+    }
     return 0;
 }
 static HRESULT WINAPI d_GetDeviceData(void *t, DWORD sz, void *buf, DWORD *n, DWORD fl)
@@ -780,10 +940,14 @@ static void install(void)
     g_log = open_out("hook.log");
     g_trace = open_out("trace.bin");
     g_tbuf = VirtualAlloc(NULL, TBUF_SIZE, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    mask_build();
+    g_findpool = VirtualAlloc((void *)0x3C000000, MAX_FIND * FIND_CAP * sizeof(WIN32_FIND_DATAA), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
     g_stubs = VirtualAlloc(NULL, 65536, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-    logf_("rcthook: out=%s realtime=%d quantum=%u\n", g_out, g_realtime, g_quantum);
+    logf_("rcthook: build %016llx out=%s realtime=%d quantum=%u\n", (unsigned long long)ORACLE_BUILD_ID,
+          g_out, g_realtime, g_quantum);
     if (GetEnvironmentVariableA("RCTHOOK_SCRIPT", v, sizeof v)) load_script(v);
     trec(TR_HEADER, TRACE_VERSION, g_realtime | g_passthrough << 1, g_quantum);
+    trec(TR_BUILD, (uint32_t)ORACLE_BUILD_ID, (uint32_t)(ORACLE_BUILD_ID >> 32), 0);
     trec(TR_NOTE, 0, 0, g_vt);   /* note 0: virtual clock at start (seed) */
 
     /* time */
@@ -809,6 +973,10 @@ static void install(void)
     IAT(0x5E7014, p_GetUserNameA);
     IAT(0x5E71F0, p_GlobalMemoryStatus);
     IAT(0x5E719C, p_GetDiskFreeSpaceA);
+    IAT(0x5E7180, p_GetEnvironmentStrings);
+    IAT(0x5E71FC, p_GetEnvironmentStringsW);
+    IAT(0x5E7204, p_FreeEnvironmentStringsA);
+    IAT(0x5E7208, p_FreeEnvironmentStringsW);
     /* filesystem */
     IAT(0x5E71AC, p_FindFirstFileA);
     IAT(0x5E71A8, p_FindNextFileA);
@@ -817,6 +985,8 @@ static void install(void)
     /* modal UI: fail fast */
     IAT(0x5E72CC, p_MessageBoxA);
     IAT(0x5E729C, p_DialogBoxParamA);
+    IAT(0x5E7350, p_GetOpenFileNameA);
+    IAT(0x5E7354, p_GetSaveFileNameA);
 
     hook_at(A_RNG_STORE, 5, h_rng);
     hook_at(A_TICK, 6, h_tick);
@@ -836,6 +1006,7 @@ BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, LPVOID r)
     if (reason == DLL_PROCESS_ATTACH) install();
     else if (reason == DLL_PROCESS_DETACH && !g_quitting) {
         trec(TR_END, g_frame, g_tick, g_rng_draws); tflush();
+        spike_abort();
         logf_("process detach at frame %u tick %u\n", g_frame, g_tick);
     }
     return TRUE;

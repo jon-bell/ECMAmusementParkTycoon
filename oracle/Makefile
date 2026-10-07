@@ -6,8 +6,12 @@ OUT ?= ../out/oracle-bin
 
 all: $(OUT)/dinput.dll
 
-$(OUT)/dinput.dll: rcthook.c spike.c spike.h callasm.S trace.h dinput.def | $(OUT)
-	$(CC) $(CFLAGS) -shared -o $@ rcthook.c spike.c callasm.S dinput.def -lwinmm -lgdi32 -static-libgcc -Wl,--enable-stdcall-fixup -Wl,--no-insert-timestamp
+SRC = rcthook.c spike.c apitrace.c callasm.S apitrace_asm.S
+DEPS = $(SRC) spike.h trace.h mask.h dinput.def apisig.txt Makefile
+# build identity: the first 64 bits of the SHA-256 of every oracle source (TR_BUILD, hook.log)
+BUILD_ID := $(shell cat $(DEPS) | sha256sum | cut -c1-16)
+$(OUT)/dinput.dll: $(DEPS) | $(OUT)
+	$(CC) $(CFLAGS) -DORACLE_BUILD_ID=0x$(BUILD_ID)ULL -shared -o $@ $(SRC) dinput.def -lwinmm -lgdi32 -static-libgcc -Wl,--enable-stdcall-fixup -Wl,--no-insert-timestamp
 
 $(OUT):
 	mkdir -p $@

@@ -191,6 +191,12 @@ def main():
             continue
         traces = [T.load(os.path.join(r['dir'], 'trace.bin')) for r in runs]
         c['observations'] = stats(T.projection(traces[0], T.PROJECTIONS['game+input']))
+        # every run of a case must come from the same oracle build (TR_BUILD)
+        sh0 = results.get((cid, 'shift'))
+        builds = {T.build_id(t) for t in traces}
+        if sh0 is not None and sh0['ok']:
+            builds.add(T.build_id(T.load(os.path.join(sh0['dir'], 'trace.bin'))))
+        c['build'] = sorted(f'{b[0]:016x}' if b else 'none' for b in builds)
         c['comparisons'] = []
         ok = True
         for i in range(1, a.runs):
@@ -213,6 +219,9 @@ def main():
                 c['layout_shift'] = 'identical (masked)' if same else \
                     f"DIFFERS at tick {rep['tick']} ({rep['kind']}): {rep['a']} | {rep['b']}"
                 ok = ok and same
+        if len(builds) != 1 or None in builds:
+            ok = False
+            c['mixed_builds'] = 'runs come from different oracle builds (TR_BUILD): ' + ', '.join(c['build'])
         o = c['observations']
         if o['ticks'] == 0 or o['rng_draws'] == 0 or o['state_hashes'] == 0:
             ok = False
@@ -269,6 +278,7 @@ def environment():
             'kernel': sh('uname -r'), 'os': sh('. /etc/os-release && echo $PRETTY_NAME'),
             'rct_md5': sh(f"md5sum '{ROOT}/game/cd/English/rct.exe' | cut -d' ' -f1"),
             'hook_md5': sh(f"md5sum '{os.environ.get('ORACLE_BIN', '')}/dinput.dll' | cut -d' ' -f1"),
+            'hook_build': sh(f"make -s -pn -C '{ROOT}/oracle' 2>/dev/null | sed -n 's/^BUILD_ID := //p' | head -1"),
             'git': sh(f"git -C '{ROOT}' describe --always --dirty")}
 
 
@@ -306,6 +316,8 @@ def render(rep):
             L.append('        ' + c['reason'])
         if c.get('vacuous'):
             L.append('        ' + c['vacuous'])
+        if c.get('mixed_builds'):
+            L.append('        ' + c['mixed_builds'])
         if c.get('detail'):
             L.append('        ' + c['detail'].replace('\n', '\n        '))
     L.append(f"  observations compared per run pair: {tot.get('ticks', 0)} ticks, {tot.get('rng_draws', 0)} RNG draws, "

@@ -51,11 +51,13 @@ def load(path):
 #   os    : what the OS fed in or the instrument observed (frames and the virtual clock, window
 #           messages delivered/dropped, file opens, run configuration).
 CORE = {K[k] for k in ('TR_RNG', 'TR_TICK', 'TR_STATE', 'TR_CHUNK', 'TR_FINAL', 'TR_MSTATE')}
-GAME = CORE | {K[k] for k in ('TR_COMMAND', 'TR_REGS_IN', 'TR_REGS_IN2', 'TR_REGS_OUT', 'TR_REGS_OUT2',
+GAME = CORE | {K[k] for k in ('TR_COMMAND', 'TR_REGS_IN', 'TR_REGS_IN2', 'TR_REGS_IN3', 'TR_REGS_OUT', 'TR_REGS_OUT2',
                               'TR_REGS_OUT3', 'TR_LOAD', 'TR_NOTE', 'TR_END')}
-INPUT = {K[k] for k in ('TR_INPUT', 'TR_INJECT', 'TR_INJ_IN', 'TR_INJ_IN2')}
+INPUT = {K[k] for k in ('TR_INPUT', 'TR_INJECT', 'TR_INJ_IN', 'TR_INJ_IN2', 'TR_INJ_IN3')}
 OS = {K[k] for k in ('TR_HEADER', 'TR_FRAME', 'TR_MSG', 'TR_MSG_DROP', 'TR_FILE')}
-assert CORE | GAME | INPUT | OS == set(_kinds), set(_kinds) - (CORE | GAME | INPUT | OS)
+# meta: who produced the trace (TR_BUILD). No projection compares it; compare() warns instead.
+META = {K['TR_BUILD']}
+assert CORE | GAME | INPUT | OS | META == set(_kinds), set(_kinds) - (CORE | GAME | INPUT | OS | META)
 RNG = {K['TR_RNG'], K['TR_TICK']}
 # masked: RNG + state with OS-derived dwords (addresses of OS-allocated memory, handles) excluded;
 # the comparator for programs that do not reproduce Wine's memory layout (Stage 1 lift)
@@ -87,6 +89,20 @@ def fmt(r):
     return f'{k} {a:#x} {b:#x} {c:#x}'
 
 
+def build_id(recs):
+    """(id, producer) from TR_BUILD, or None for traces older than version 3"""
+    b = next((r for r in recs[:4] if r[0] == K['TR_BUILD']), None)
+    return (b[2] << 32 | b[1], b[3]) if b else None
+
+
+def build_warning(ra, rb):
+    a, b = build_id(ra), build_id(rb)
+    if a == b:
+        return None
+    f = lambda x: 'none (version < 3)' if x is None else f"{x[0]:016x} ({'oracle' if x[1] == 0 else 'lift host' if x[1] == 1 else x[1]})"
+    return f'WARNING: build ids differ: A {f(a)}, B {f(b)}'
+
+
 def summary(path):
     recs = load(path)
     cnt = Counter(_kinds.get(r[0], hex(r[0])) for r in recs)
@@ -96,6 +112,9 @@ def summary(path):
     print(f'trace {path}: {len(recs)} records')
     if hdr:
         print(f'  version={hdr[1]} realtime={hdr[2]} quantum={hdr[3]}')
+    bid = build_id(recs)
+    if bid:
+        print(f'  build={bid[0]:016x} producer={bid[1]}')
     for k, v in sorted(cnt.items()):
         print(f'  {k:12s} {v}')
     if end:
@@ -120,6 +139,7 @@ def compare(pa, pb, proj='game+input'):
     ra_all, rb_all = (pa if isinstance(pa, list) else load(pa)), (pb if isinstance(pb, list) else load(pb))
     a, b = projection(ra_all, PROJECTIONS[proj]), projection(rb_all, PROJECTIONS[proj])
     rep = {'projection': proj, 'records_a': len(a), 'records_b': len(b),
+           'build_warning': build_warning(ra_all, rb_all),
            'rng_a': sum(r[0] == K['TR_RNG'] for r in a), 'rng_b': sum(r[0] == K['TR_RNG'] for r in b),
            'ticks_a': sum(r[0] == K['TR_TICK'] for r in a), 'ticks_b': sum(r[0] == K['TR_TICK'] for r in b),
            'states_a': sum(r[0] == K['TR_STATE'] for r in a)}
@@ -158,6 +178,8 @@ def compare(pa, pb, proj='game+input'):
 
 
 def print_compare(ok, rep, out=sys.stdout):
+    if rep.get('build_warning'):
+        print(rep['build_warning'], file=out)
     print(f"projection {rep['projection']}: records {rep['records_a']} vs {rep['records_b']}; "
           f"rng draws {rep['rng_a']} vs {rep['rng_b']}; ticks {rep['ticks_a']} vs {rep['ticks_b']}", file=out)
     if ok:

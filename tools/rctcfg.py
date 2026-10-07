@@ -32,6 +32,27 @@ DATA = {'.rdata': (0x5E7000, 0x5E7000 + 0x1F46), '.data': (0x5E9000, 0x5E9000 + 
         'DATASEG': (0x5F4000, 0x9A161C), 'DataSeg': (0x9A2000, 0x9B2301)}
 IAT = (0x5E7000, 0x5E7364)
 CMD_TABLE, CMD_COUNT = 0x5F49A0, 49
+# Entry points only the OS calls (callbacks handed to Win32), trusted seeds since map v3. The v2
+# heuristic gate dropped the window procedure, so the lift hit MissingBlock at the first
+# CreateWindowExA.
+OS_CALLBACKS = {
+    0x403D79: 'window procedure (WNDCLASS.lpfnWndProc, stored at 0x405F6A)',
+    0x4037CF: 'dialog procedure (CreateDialogParamA, 0x403A46)',
+    0x408B9D: 'EnumDisplayModes callback (0x408BDF)',
+    0x408C1C: 'EnumDisplayModes callback (0x408D28)',
+    0x40C8A6: 'timeSetEvent callback (0x40D35B)',
+}
+# Block starts the static descent cannot find (targets of computed jumps/calls), each confirmed
+# executed by the oracle (RCTHOOK_SPIKE=cover=<these addresses>, "N of N addresses executed").
+# Trusted seeds since map v4. Found by the HOST workstream's lift runs (MissingBlock).
+DYNAMIC_ENTRIES = {
+    0x532BC5: 'jmp [ebp*4+0x532BCC] table entry (0x52CF8C); title frame 1; oracle cover title: hit',
+    0x532091: 'title case; oracle cover title: hit',
+    0x5A6545: 'title case; oracle cover title: hit',
+    0x4AB261: 'title case; oracle cover title: hit',
+    0x481D11: 'title case; oracle cover title: hit',
+    0x4A023D: 'title case; oracle cover title: hit',
+}
 
 FLAG_TEST = 0
 FLAG_WRITE = 0
@@ -88,8 +109,14 @@ def mem_ops(i):
     return [o for o in i.operands if o.type == X.X86_OP_MEM]
 
 
+def is_jump(i):
+    # capstone does not put loop/loope/loopne in its jump group (map v2 missed their targets and
+    # fall-throughs as block starts; found by the lifter, v3 fixes it)
+    return i.group(capstone.CS_GRP_JUMP) or i.mnemonic in ('loop', 'loope', 'loopne')
+
+
 def is_jcc(i):
-    return i.group(capstone.CS_GRP_JUMP) and i.mnemonic not in ('jmp', 'ljmp')
+    return is_jump(i) and i.mnemonic not in ('jmp', 'ljmp')
 
 
 # Instructions ring-3 Win32 game code has no use for. Seeing one in a heuristic seed's
@@ -211,11 +238,11 @@ def discover(im, seeds, base=None, limit=None):
                 owner.setdefault(b, a)
             nxt = a + i.size
             m = i.mnemonic
-            if m.startswith('bnd ') or i.prefix[0] == 0xF2 and (i.group(capstone.CS_GRP_JUMP) or i.group(capstone.CS_GRP_CALL)):
+            if m.startswith('bnd ') or i.prefix[0] == 0xF2 and (is_jump(i) or i.group(capstone.CS_GRP_CALL)):
                 R['bad'].append((a, 'prefixed branch'))
             if m in ('ret', 'retf', 'iretd', 'hlt', 'ud2', 'int3'):
                 break
-            is_j = i.group(capstone.CS_GRP_JUMP)
+            is_j = is_jump(i)
             is_c = i.group(capstone.CS_GRP_CALL)
             if not (is_j or is_c):
                 a = nxt
@@ -335,7 +362,7 @@ def gated(im, G, seeds, stats, ctx, limit=20000):
 def direct_targets(G):
     out = set()
     for a, i in G['insn_at'].items():
-        if (i.group(capstone.CS_GRP_JUMP) or i.group(capstone.CS_GRP_CALL)) and i.operands and \
+        if (is_jump(i) or i.group(capstone.CS_GRP_CALL)) and i.operands and \
                 i.operands[0].type == X.X86_OP_IMM:
             out.add(i.operands[0].imm & 0xFFFFFFFF)
     return out
@@ -352,7 +379,7 @@ def split_blocks(res):
     """Basic-block leaders: block_starts plus instruction after every control transfer."""
     leaders = set(a for a in res['block_starts'] if a in res['insn_at'])
     for a, i in res['insn_at'].items():
-        if i.group(capstone.CS_GRP_JUMP) or i.group(capstone.CS_GRP_CALL) or i.mnemonic in ('ret', 'retf'):
+        if is_jump(i) or i.group(capstone.CS_GRP_CALL) or i.mnemonic in ('ret', 'retf'):
             n = a + i.size
             if n in res['insn_at']:
                 leaders.add(n)
@@ -362,7 +389,7 @@ def split_blocks(res):
 def imm_code_refs(res):
     out = set()
     for a, i in res['insn_at'].items():
-        if i.group(capstone.CS_GRP_JUMP) or i.group(capstone.CS_GRP_CALL):
+        if is_jump(i) or i.group(capstone.CS_GRP_CALL):
             continue
         for o in i.operands:
             if o.type == X.X86_OP_IMM:
@@ -421,6 +448,59 @@ def decodes_cleanly(im, a, n=6):
     return True
 
 
+def dispatch_stubs(im):
+    """Jump-table dispatch stubs and their entry points (trusted seeds since map v4).
+
+    (a) every `jmp [reg*4 + disp32]` whose table starts right after it (disp32 == address + 7),
+        or a run of such stubs followed by their tables in order (one pair in rct.exe, found by
+        the lift: 0x564945): an unmistakable dispatcher, reached through pointer tables. The v2/v3 gate rejected them:
+        the stub's own disp32 is a code pointer aligned with the table, so TABLE_MASK covered the
+        stub's bytes.
+    (b) every aligned dword in a pointer table (a run of >= 2 code pointers in a code section)
+        that points at a single non-transfer instruction directly followed by such a stub:
+        entries with a one-instruction prologue (e.g. `mov edi, 1` at 0x551374, referenced from
+        0x551328). A looser rule (any byte offset, up to 4 instructions) admitted false entries
+        that overlap real code."""
+    img = bytes(im.img)
+
+    def cand(a):
+        o = a - IB
+        if img[o] == 0xFF and img[o + 1] == 0x24 and (img[o + 2] >> 6) == 2 and (img[o + 2] & 7) == 5:
+            return struct.unpack_from('<I', img, o + 3)[0]
+        return None
+    stubs = set()
+    for lo, hi in SECTIONS.values():
+        for a in range(lo, hi - 7):
+            d = cand(a)
+            if d is None or not a + 7 <= d <= a + 7 * 64:
+                continue
+            # a run of n consecutive stubs whose first table starts right after the run, tables
+            # ascending (n = 1: the common case; n = 2 once: 0x56493E, 0x564945)
+            run = [a]
+            while len(run) < 64 and cand(run[-1] + 7) is not None:
+                run.append(run[-1] + 7)
+            for n in range(len(run), 0, -1):
+                ds = [cand(x) for x in run[:n]]
+                if ds[0] == a + 7 * n and all(ds[k] < ds[k + 1] for k in range(n - 1)):
+                    stubs.update(run[:n])
+                    break
+    entries = set()
+    for lo, hi in SECTIONS.values():
+        for a in range((lo + 3) & ~3, hi - 3, 4):
+            v = struct.unpack_from('<I', img, a - IB)[0]
+            if v in stubs or not in_code(v):
+                continue
+            # the reference must sit in a pointer table: an aligned run of >= 2 code pointers
+            nb = [struct.unpack_from('<I', img, a + d - IB)[0] for d in (-4, 4) if lo <= a + d < hi - 3]
+            if not any(in_code(x) for x in nb):
+                continue
+            i = im.insn(v)
+            if i is not None and v + i.size in stubs and not is_jump(i) and not i.group(capstone.CS_GRP_CALL) \
+                    and i.mnemonic not in ('ret', 'int3'):
+                entries.add(v)
+    return stubs, entries
+
+
 def main():
     exe = sys.argv[1] if len(sys.argv) > 1 else 'game/cd/English/rct.exe'
     out = sys.argv[2] if len(sys.argv) > 2 else 'out/spikes/s1'
@@ -432,7 +512,18 @@ def main():
     TABLE_MASK.update(table_mask(im))
     dyn_path = os.path.join(os.path.dirname(out.rstrip('/')), 'istep_addrs.bin')
     dyn = load_dyn(dyn_path)
-    trusted_seeds = [(entry, True)] + [(c, True) for c in cmd] + [(d, False) for d in dyn if in_code(d)]
+    # Block starts the oracle executed with one-shot breakpoints on a previous map (union of
+    # cover_hits.bin over the corpus; written by the lift workstream): trusted like the istep
+    # addresses, so a new map never loses a block start the game is known to enter (map v4).
+    cover_path = os.path.join(os.path.dirname(out.rstrip('/')), 'cover_addrs.bin')
+    dyn_cover = load_dyn(cover_path)
+    dyn = sorted(set(dyn) | set(dyn_cover))
+    stubs, stub_entries = dispatch_stubs(im)
+    stub_seeds = stubs | stub_entries
+    trusted_seeds = [(entry, True)] + [(c, True) for c in cmd] + [(a, True) for a in sorted(OS_CALLBACKS)] + \
+        [(a, False) for a in sorted(DYNAMIC_ENTRIES)] + \
+        [(a, False) for a in sorted(stub_seeds)] + \
+        [(d, False) for d in dyn if in_code(d)]
     T = discover(im, trusted_seeds)                                        # pass A + dynamic: trusted
     G = new_state()
     merge(G, T)
@@ -526,6 +617,11 @@ def main():
     prov = ['A/dyn' if b_ in tset else 'heuristic' for b_ in blocks]
     cfg = {
         'binary_md5': '59e88bbcf3a6db7ea81c648a4afba935',
+        'map_version': 4,
+        'os_callbacks': {hex(a): w for a, w in sorted(OS_CALLBACKS.items())},
+        'dynamic_entries': {hex(a): w for a, w in sorted(DYNAMIC_ENTRIES.items())},
+        'dispatch_stubs': sorted(stubs), 'dispatch_stub_entries': sorted(stub_entries),
+        'dynamic_seed_files': {'istep': [dyn_path, len(load_dyn(dyn_path))], 'cover': [cover_path, len(dyn_cover)]},
         'functions': sorted(G['funcs']),
         'blocks': blocks,
         'block_provenance': prov,
@@ -748,7 +844,7 @@ def analyse(im, R, blocks, snap, gate, refs, dptr, cmd, embedded=()):
     for a, i in ins.items():
         for o in i.operands:
             if o.type == X.X86_OP_MEM and o.mem.base == 0 and o.mem.index == 0 and in_code(o.mem.disp & 0xFFFFFFFF) \
-                    and not (i.group(capstone.CS_GRP_JUMP) or i.group(capstone.CS_GRP_CALL)):
+                    and not (is_jump(i) or i.group(capstone.CS_GRP_CALL)):
                 (smc_w if o.access & capstone.CS_AC_WRITE else smc_r).append((a, o.mem.disp & 0xFFFFFFFF))
     L.append(f'- **absolute memory operands inside code sections** (candidate self-modifying code / data in code): '
              f'{len(smc_w)} writes, {len(smc_r)} reads')
@@ -892,7 +988,7 @@ def analyse(im, R, blocks, snap, gate, refs, dptr, cmd, embedded=()):
     popret = [t for t in R['funcs'] if t in ins and ins[t].mnemonic == 'pop']
     L.append(f'- call targets starting with pop (return address consumed as data?): {len(popret)} ' + ', '.join(hex(a) for a in sorted(popret)[:20]))
     # jmp/call register
-    jreg = [(a, f'{i.mnemonic} {i.op_str}') for a, i in ins.items() if (i.group(capstone.CS_GRP_JUMP) or i.group(capstone.CS_GRP_CALL))
+    jreg = [(a, f'{i.mnemonic} {i.op_str}') for a, i in ins.items() if (is_jump(i) or i.group(capstone.CS_GRP_CALL))
             and i.operands and i.operands[0].type == X.X86_OP_REG]
     L.append(f'- jmp/call through register: {len(jreg)}')
     # jump tables summary
@@ -905,7 +1001,7 @@ def analyse(im, R, blocks, snap, gate, refs, dptr, cmd, embedded=()):
     L.append(f"- overlapping instructions: {len(R['overlaps'])}")
     # functions sharing code (blocks reachable from more than one function entry without calls) — tail sharing
     fall_into = [f for f in R['funcs'] if f in ins and any((p in ins and p + ins[p].size == f and not (
-        ins[p].mnemonic in ('ret', 'jmp') or ins[p].group(capstone.CS_GRP_JUMP) and not is_jcc(ins[p]))) for p in range(f - 15, f))]
+        ins[p].mnemonic in ('ret', 'jmp') or is_jump(ins[p]) and not is_jcc(ins[p]))) for p in range(f - 15, f))]
     L.append(f'- function entries reached by fall-through from preceding code (shared bodies / multiple entries): {len(fall_into)}')
     # calls to CodeSeg addresses that are written
     L.append('')
@@ -1007,7 +1103,7 @@ def imports_reached(im, ins, start):
         for o in i.operands:
             if o.type == X.X86_OP_MEM and o.mem.base == 0 and o.mem.index == 0:
                 d = o.mem.disp & 0xFFFFFFFF
-                if d in im.imports and (i.group(capstone.CS_GRP_CALL) or i.group(capstone.CS_GRP_JUMP)):
+                if d in im.imports and (i.group(capstone.CS_GRP_CALL) or is_jump(i)):
                     out.add(im.imports[d].split('!')[1])
         if i.mnemonic == 'ret':
             break

@@ -1,0 +1,11 @@
+{
+  "comment": "Forced block starts. The lifter starts a block at each address, so the dispatcher can run m.hooks before it (docs/stage1-design.md). Hooks may be registered only at lifted block starts; to hook a new address, add it here and re-run lift/lifter.py.",
+  "hooks": [
+    {"addr": "0x5DF42A", "name": "rng_store", "what": "RNG store; eax = drawn value, caller = r32(esp+4) - 5"},
+    {"addr": "0x43888E", "name": "tick_start", "what": "first instruction of a logic tick"},
+    {"addr": "0x4385D8", "name": "frame_entry", "what": "per-frame function called by the main loop at 0x4010F7"},
+    {"addr": "0x4386EC", "name": "frame_body", "what": "frame body, after [0x991F6C] = esp; runs frame actions"},
+    {"addr": "0x426F56", "name": "game_do_command", "what": "game_do_command entry; esi = command"},
+    {"addr": "0x43054E", "name": "start_scenario", "what": "load target (redirect destination of the load action)"}
+  ]
+}

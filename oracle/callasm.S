@@ -1,5 +1,5 @@
 /* void __cdecl call_asm(uint32_t target, regs_t *r)
- * Calls a game routine with eax..ebp taken from *r and stores eax..ebp and eflags back.
+ * Calls a game routine with eax..ebp and eflags taken from *r and stores eax..ebp and eflags back.
  * regs_t layout (pushad order): edi 0, esi 4, ebp 8, esp 12, ebx 16, edx 20, ecx 24, eax 28, eflags 32 */
     .intel_syntax noprefix
     .text
@@ -19,6 +19,8 @@ _call_asm:
     mov esi, [ecx+4]
     mov edi, [ecx+0]
     mov ebp, [ecx+8]
+    push dword ptr [ecx+32]    /* eflags as given (the caller defines them) */
+    popfd
     mov ecx, [ecx+24]
     call dword ptr [esp]
     pushfd
