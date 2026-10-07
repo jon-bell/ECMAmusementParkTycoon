@@ -6,7 +6,7 @@
   rcttrace.py compare  <a.bin> <b.bin> [projection]
                                          first divergence (exit 0 iff identical); projections:
                                          rng, masked, core, game, input, os,
-                                         game+input (default)
+                                         game+input (default), lift (Stage 1 gate)
   rcttrace.py rng      <trace.bin> [n]      print the first n RNG draws
 """
 import os
@@ -62,7 +62,14 @@ RNG = {K['TR_RNG'], K['TR_TICK']}
 # masked: RNG + state with OS-derived dwords (addresses of OS-allocated memory, handles) excluded;
 # the comparator for programs that do not reproduce Wine's memory layout (Stage 1 lift)
 MASKED = RNG | {K['TR_MSTATE']}
-PROJECTIONS = {'rng': RNG, 'masked': MASKED, 'core': CORE, 'game': GAME, 'input': INPUT, 'os': OS, 'game+input': GAME | INPUT}
+# lift: the Stage 1 acceptance projection (docs/stage1-design.md, decision 4): rng + masked state +
+# game without the raw-state records (TR_STATE, TR_CHUNK, TR_FINAL hash memory whose layout the OS
+# chooses) + input. Raw core and os are compared separately and reported as information.
+RAW_STATE = {K['TR_STATE'], K['TR_CHUNK'], K['TR_FINAL']}
+LIFT = (GAME | INPUT) - RAW_STATE
+assert MASKED <= LIFT
+PROJECTIONS = {'rng': RNG, 'masked': MASKED, 'core': CORE, 'game': GAME, 'input': INPUT, 'os': OS, 'game+input': GAME | INPUT,
+               'lift': LIFT}
 
 
 def projection(recs, kinds=None):

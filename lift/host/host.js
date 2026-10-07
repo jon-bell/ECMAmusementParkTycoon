@@ -82,6 +82,7 @@ class Host {
     this.voidFns = new Set([...loadSigs(fs.readFileSync(path.join(__dirname, '../../oracle/apisig.txt'), 'utf8')).sigs.values()]
       .filter((g) => g.ret.base === 'v').map((g) => g.name));
     this.osObjects = [];          // [ptr, iface] of COM objects handed to the game (osmap.txt)
+    this.osVtables = [];          // [ptr, iface] of their vtables (osmap.txt "vtbl")
     this.onFrame = null;
   }
 
@@ -175,6 +176,7 @@ class Host {
       L.push(`fn ${((this.rt.HOST_BASE + 16 * k) >>> 0).toString(16)} ${im ? im.iat.toString(16) : '0'} ${this.traceName(nm)}`);
     }
     for (const [p, iface] of this.osObjects) L.push(`obj ${p.toString(16)} ${iface}`);
+    for (const [p, iface] of this.osVtables) L.push(`vtbl ${p.toString(16)} ${iface}`);
     fs.writeFileSync(path.join(this.outDir, 'osmap.txt'), L.join('\n') + '\n');
   }
 
@@ -231,6 +233,7 @@ class Host {
     const obj = this.processHeap.alloc(4 + extra);
     G.w32(obj, vt);
     this.osObjects.push([obj, iface]);
+    this.osVtables.push([vt, iface]);
     return obj;
   }
 

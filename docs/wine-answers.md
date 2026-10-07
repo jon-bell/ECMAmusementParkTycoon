@@ -13,7 +13,11 @@ Values are as the game sees them, through the oracle's pins. Hex is without `0x`
 
 - **API traces** (`RCTHOOK_SPIKE=apitrace`, `oracle/README.md` "API trace"): every call the game
   makes, with arguments, results and out-params, and every callback into game code.
-  - Runs: all 43 corpus cases (`corpus/public`, `corpus/heldout`), once each (`out/oi/at4/*-r0`).
+  - Runs: all 43 corpus cases (`corpus/public`, `corpus/heldout`), once each (`out/oi/at4/*-r0`,
+    oracle build of 2026-10-07 00:10). In 14 cases with long scripts, that build still placed
+    Wine's memory differently (heap `1A20000`, view `3CA0000`, DIB `52E0000`, caused by the hook's
+    own action list). The current build gives Wine's layout for every script (`oracle/README.md`);
+    the addresses below are that layout.
     Five cases were run twice more: a second clean run with a different environment size and run
     directory (`-r1`), and a layout-shifted run (`-shift`, `heapshift=200003`, which moves the
     heap, mappings and kernel, USER and GDI handle numbers).
@@ -56,10 +60,10 @@ Values are as the game sees them, through the oracle's pins. Hex is without `0x`
 | `GetModuleFileNameA(0)` | 40, `C:\Program Files\Hasbro Interactive\RollerCoaster Tycoon\rct.exe` (into `.data` `5EFF10`) | yes | no |
 | `GetModuleHandleA` | NULL→`400000`, "KERNEL32"→`7BB90000` | yes | n/a |
 | `LoadLibraryA("DDRAW.DLL")` | `76D50000` (varies with the oracle build: Wine places DLLs) | per build | no (not in state) |
-| `HeapCreate(1,1000,0)` | `1A20000` (`1920000` in other runs) | layout | masked/irrelevant (heap) |
+| `HeapCreate(1,1000,0)` | `1920000` | layout | heap; not in state |
 | `VirtualAlloc` | `0,400000,MEM_RESERVE` → `2E70000`; commit `10000` there | layout | heap |
-| `CreateFileMappingA` / `MapViewOfFile` (CSG1.DAT) | handle `D8`; view `3CA0000` (`3C80000` in earlier runs) | layout | masked (`mask.h`) |
-| `CreateDIBSection` 1024×−768×8 | HBITMAP `3090085`; bits `52E0000` | layout | bits masked |
+| `CreateFileMappingA` / `MapViewOfFile` (CSG1.DAT) | handle `D8`; view `3C80000` | layout | masked (`mask.h`) |
+| `CreateDIBSection` 1024×−768×8 | HBITMAP `3090085`; bits `19A0000` | layout | bits masked |
 | `CreateFileA` handles | `D4` for every file, since each is closed before the next opens; `C8`/`CC` registry keys | yes | `5F88A4` masked |
 | `ReadFile`, `SetFilePointer` | byte counts and positions of the user's own files | yes (the files) | yes: file data |
 | `RegOpenKeyA`/`RegQueryValueExA` | see "Registry" | yes | **yes**: written into DATASEG |
@@ -177,14 +181,39 @@ messages. Both are pinned (`oracle/README.md`).
   oracle's `put_find` does.
 - `mciSendStringA`'s return buffer (NULL here).
 
-## Pins added in Stage 1 because API traces showed run-to-run variation
+## Pins added in Stage 1
 
-`GetEnvironmentStrings(W)` (a fixed block), `PeekMessageA`'s `MSG.time` and `MSG.pt`, the search
-handle of `FindFirstFileA`, and the common file dialogs. See `oracle/README.md`.
+These were added because API traces showed run-to-run variation, or because a value reached game
+state that the host could not reproduce without imitating Wine's internals:
+- `GetEnvironmentStrings(W)`: a fixed block.
+- `PeekMessageA`: `MSG.time` and `MSG.pt`.
+- `FindFirstFileA`: the search handle (the game keeps it in DATASEG `0x5F9427`).
+- The common file dialogs.
+- **Registers after every OS call:** ecx = edx = 0, eax = 0 for void functions, eflags `0x202`.
+
+See `oracle/README.md`, "Pins". Under the register pin the scratch registers after a call are
+part of the environment. The host sets them exactly so; nothing Wine leaves there is visible to
+the game.
 
 ## Stability
 
-Pending the completed batch.
+- **Across cases.** Every answer in the summary is identical at the same call site in all 43
+  cases. The exceptions:
+  - pointers into Wine's process memory that move with the environment size (`GetStartupInfoA`'s
+    strings, `GetCommandLineA`'s buffer);
+  - the virtual time stamped on the two start-up messages the game dispatches;
+  - layout values in the 14 long-script cases, explained above.
+- **Across runs and layouts.** Five cases were run twice more: `title`, `forest-frontiers-open`,
+  `tour-sc03-diamond-heights`, held-out `tour-sc17-lightning-peaks` and `leafy-lake-open`.
+  - A second clean run (different environment size and run directory) is canonically IDENTICAL
+    under `tools/apitrace.py diff` in all five (349,783 to 1,279,613 records).
+  - So is a layout-shifted run (`heapshift`: heap, mappings, kernel, USER and GDI handles all
+    moved) in all five. `out/oi/stability.txt`.
+- **The comparator can fail.** Three mutants of the title trace were each reported at the mutated
+  record: one `GetSystemMetrics` answer +1, one `ReadFile` buffer hash, one dropped
+  dialog-procedure callback.
+- **Messages.** The message sequence is identical in all 43 cases, and no message reaches game code
+  after frame 1.
 
 ## Regenerating
 

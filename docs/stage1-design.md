@@ -193,3 +193,46 @@ It must reject known-bad lifts before its passes count:
 Acceptance also states the coverage the corpus reached (target: at least 50% of CODESEG
 instructions; `docs/stage1-scope.md` M9). Code never executed by the corpus is lifted but not
 validated, and the report says so.
+
+## As implemented (2026-10-07)
+
+These are the points where the build differs from, or adds to, the plan above. Details are in
+`lift/runtime/README.md`, `oracle/README.md` and `docs/wine-answers.md`.
+
+**Code map.** Official map is v4 (`out/spikes/s1v4`, `tools/rctcfg.py`): 92,055 blocks. On top
+of v2 it adds:
+- OS-called entry points (the window procedure `0x403D79` was missing);
+- `loop` targets;
+- 610 jump-table dispatch stubs;
+- every block start the oracle executed, as trusted seeds.
+
+It is validated by armed breakpoints on every block over all 43 corpus cases.
+
+**Markers.** `HOST_RETURN_LOAD = 0xFFFFFFE0` and `HOST_EXIT = 0xFFFFFFD0`. The `load` target
+`0x43054E` is a forced block start.
+
+**Flags.** Computed only where live, and exact at every hook address, `ret`, indirect transfer
+and host call. Flags the manual leaves undefined are measured on this machine's CPU (AMD Zen 2).
+`cpuid` returns this machine's values: environment-dependent.
+
+**Entry state.** Process entry registers and the stack (`[0x220000, 0x320000)`, `esp`
+`0x31FF54`) are as under Wine. The host also places the C-runtime heap, DIB, CSG1 view and file
+handles where Wine does, and calls injected actions at the oracle hook's stack depth, so raw state
+matches too. The gate itself relies on the masked projection.
+
+**New pins** (oracle and host mirror each other):
+- after every OS call the game makes: `ecx = edx = 0`, `eax = 0` for void functions,
+  `eflags = 0x202`;
+- deterministic `FindFirstFile` handles;
+- fixed environment block, `MSG.time` and `MSG.pt`;
+- scripted file dialogs (`file`), `quantum`, `char`, `dimouse` and `move` actions.
+
+**Trace.** Format version 3 adds `TR_REGS_IN3`/`TR_INJ_IN3` (`ebp` and flags) and `TR_BUILD` (a
+hash of the producer's sources). The mask lives in one file, `oracle/mask.h`, read by both
+oracle and host.
+
+**Gate.** Three stages plus mutants:
+- trace (projection `lift`);
+- coverage cross-check (the lift's executed blocks must equal the oracle's breakpoint hits);
+- a **register stage** (two single-stepped tick windows per case, `tools/stepdiff.py`), added
+  because the trace stage was measured blind to some flag faults (see the gate report).

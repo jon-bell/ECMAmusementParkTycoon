@@ -137,7 +137,7 @@ class Opd:
 
 
 class Lifter:
-    def __init__(self, exe, cfg, hooks, flag_opt=True, annotate=False):
+    def __init__(self, exe, cfg, hooks, flag_opt=True, annotate=False, mutant=None, mutant_only=None):
         pe = pefile.PE(exe)
         self.img = pe.get_memory_mapped_image()
         with open(exe, 'rb') as f:
@@ -154,6 +154,13 @@ class Lifter:
         self.flag_opt = flag_opt
         self.annotate = annotate
         self.stats = {'insns': 0, 'blocks': 0}
+        # Known-bad lifts for the Stage 1 gate's self-test (tools/gate_lift.py; principle 6).
+        # None (the default) lifts exactly as without this option.
+        if mutant not in MUTANTS:
+            raise LiftError(f'unknown mutant {mutant}')
+        self.mutant = mutant
+        self.mutant_only = mutant_only          # optional set of instruction addresses to mutate
+        self.mutant_sites = set()
         for a in hooks:
             if a not in self.istarts:
                 raise LiftError(f'hook {h(a)} is not an instruction start in the map')
@@ -434,6 +441,10 @@ class Lifter:
         if mn == 'cbw':
             L.append('m.eax = (m.eax & 0xFFFF0000 | (m.eax << 24 >> 24) & 0xFFFF) >>> 0;')
             return L, None
+        if mn == 'stc' and self.mutant == 'stc-ret-drop' and self.insn(nxt).mnemonic == 'ret' and \
+                (self.mutant_only is None or i.address in self.mutant_only):
+            self.mutant_sites.add(i.address)       # mutant: the stc right before a ret is dropped
+            return L, None
         if mn == 'stc':
             if 'c' in live:
                 L.append('m.cf = 1;')
@@ -454,6 +465,10 @@ class Lifter:
             L.append(ops[0].wr(f'({COND[SETCC[mn]][0]} ? 1 : 0)', ops[0].ea if ops[0].kind == 'mem' else 'a'))
             return L, None
 
+        if mn == 'adc' and self.mutant == 'adc-nocf' and (self.mutant_only is None or i.address in self.mutant_only):
+            self.mutant_sites.add(i.address)       # mutant: adc ignores CF (lifted as add)
+            g.binop('add', *ops)
+            return L, None
         if mn in ('add', 'sub', 'adc', 'sbb', 'cmp', 'and', 'or', 'xor', 'test'):
             g.binop(mn, *ops)
             return L, None
@@ -514,6 +529,9 @@ class Lifter:
         body.append('  ' + term)
         return body
 
+
+MUTANTS = {None: 'none', 'adc-nocf': 'adc ignores CF (lifted as add)',
+           'stc-ret-drop': 'an stc immediately before a ret is dropped'}
 
 STRING_OPS = {'movsb', 'movsw', 'movsd', 'stosb', 'stosw', 'stosd', 'scasb', 'scasw', 'scasd', 'lodsb', 'lodsw', 'lodsd',
               'cmpsb', 'cmpsw', 'cmpsd'}
@@ -942,13 +960,18 @@ def main():
                     help='also emit region functions grouping the blocks of each 2^N-byte code window '
                          '(0: none). Hook addresses stay single blocks.')
     ap.add_argument('--region-max', type=int, default=100, help='max instructions per region function')
+    ap.add_argument('--mutant', choices=[k for k in MUTANTS if k],
+                    help='emit a known-bad lift (Stage 1 gate self-test only; never the official lift)')
+    ap.add_argument('--mutant-only', help='comma-separated instruction addresses: mutate only these sites')
     args = ap.parse_args()
     if args.insns:
         args.single = True
 
     cfg = json.load(open(args.map))
     hooks = [int(x['addr'], 16) for x in json.load(open(args.hooks))['hooks']]
-    lf = Lifter(args.exe, cfg, hooks, flag_opt=not (args.no_flag_opt or args.single), annotate=args.annotate)
+    lf = Lifter(args.exe, cfg, hooks, flag_opt=not (args.no_flag_opt or args.single), annotate=args.annotate,
+                mutant=args.mutant,
+                mutant_only={int(x, 16) for x in args.mutant_only.split(',')} if args.mutant_only else None)
     if cfg.get('binary_md5') != lf.md5:
         raise LiftError('map was built from a different binary')
     os.makedirs(args.out, exist_ok=True)
@@ -1091,6 +1114,8 @@ def main():
         'derived_leaders': [h(a) for a in sorted(lf.derived)],
         'stats': lf.stats,
     }
+    if args.mutant:
+        man['mutant'] = {'name': args.mutant, 'what': MUTANTS[args.mutant], 'sites': [h(a) for a in sorted(lf.mutant_sites)]}
     with open(os.path.join(args.out, 'manifest.json'), 'w') as f:
         json.dump(man, f, indent=1)
     print(json.dumps({k: man[k] for k in ('mode', 'flag_opt', 'nblocks', 'ninsns', 'extra_leaders')}),

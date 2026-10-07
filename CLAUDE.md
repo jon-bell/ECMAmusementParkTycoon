@@ -114,7 +114,8 @@ oracle/      hook DLL built as dinput.dll: pins nondeterminism, traces RNG/state
 scripts/     setup-host.sh, install-native.sh, oracle-run.sh, gate-determinism.sh
 tools/       rcttrace.py (read/compare traces), gate_determinism.py, rctdis.py, rctcfg.py (static
              code map), coverbisect.py, ptrmask.py, dumpdiff.py
-docs/        stage1-scope.md: spike measurements and proposed Stage 1 decisions
+lift/        Stage 1 lift: lifter.py (x86 -> JS into out/lift), runtime/, host/ (pinned Win32), test/
+docs/        stage1-scope.md (measurements), stage1-design.md (decisions, interfaces), wine-answers.md
 corpus/      input scripts: public/ (porting may use) and heldout/ (porting never sees)
 install/     registry Setup.exe writes
 game/        User-supplied CD contents and the pristine prefix (git-ignored)
@@ -128,7 +129,14 @@ scripts/oracle-run.sh out/runs/x <script>     # one pinned run -> trace.bin, hoo
 scripts/gate-determinism.sh                   # Stage 0 gate -> out/gate/<time>/report.txt
 python3 tools/rcttrace.py compare A/trace.bin B/trace.bin [rng|masked|core|game|input|os]
 scripts/oracle-run.sh out/runs/x <script> -- RCTHOOK_SPIKE=apicount,codewatch   # measurement modes
+.venv/bin/python lift/lifter.py              # generate the lift into out/lift (never committed)
+scripts/lift-run.sh out/lruns/x <script>     # run the lift on a script -> trace.bin in the oracle's format
+scripts/gate-lift.sh                         # Stage 1 gate: lift vs oracle on every corpus case
+python3 tools/stepdiff.py diff A/istep_regs.bin B/istep_regs.bin   # instruction-level first divergence
 ```
+
+Comparisons are only meaningful between runs of one oracle build: traces carry `TR_BUILD`;
+pass a DLL snapshot with `ORACLE_BIN` when sources may change.
 
 Shell notes: unset `TMPDIR` before any `wine`/`wineserver` command (Ubuntu's Wine 9.0 aborts
 otherwise). Never `pkill -f` a pattern that also appears in your own command line.

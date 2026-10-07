@@ -41,6 +41,11 @@ int g_apitrace_on;
 #define OUT_SIZE    0x10000000u          /* 256 MiB; flushed early (opening the file) only if full */
 #define ARENA_BASE  0x20000000u
 #define ARENA_SIZE  0x02000000u
+/* The thunks are function values the game holds (IAT slots, GetProcAddress results, COM methods):
+ * they sit at an address game data is unlikely to contain by coincidence (stepdiff compares such
+ * values by name, tools/stepdiff.py; a round address like 0x20000000 is a common game constant) */
+#define THUNK_BASE  0x5EA70000u
+#define THUNK_SIZE  0x00010000u
 static uint8_t *s_arena, *s_out, *s_thunks, *s_misc;
 static uint32_t s_out_len, s_misc_used;
 static HANDLE s_file = INVALID_HANDLE_VALUE;
@@ -495,13 +500,14 @@ static const char *dupname(const char *a, const char *b)
 }
 
 /* COM: patch a vtable (shared by all objects of the class) once */
-static void *s_vt_done[64]; static int s_nvt;
+static void *s_vt_done[64]; static int s_vt_iface[64]; static int s_nvt;
 static void patch_vtable(uint32_t obj, int iface)
 {
     if (iface < 0 || !readable(obj, 4)) return;
     void **vt = *(void ***)obj;
     for (int i = 0; i < s_nvt; i++) if (s_vt_done[i] == vt) return;
     if (s_nvt >= 64) return;
+    s_vt_iface[s_nvt] = iface;
     s_vt_done[s_nvt++] = vt;
     const iface_t *f = &s_iface[iface];
     DWORD old; VirtualProtect(vt, 4 * f->nmeth, PAGE_READWRITE, &old);
@@ -515,7 +521,7 @@ static struct { uint32_t ptr; int iface; } s_obj[64]; static int s_nobj;   /* CO
 /* osmap.txt: the OS-chosen values the game holds, for comparing register captures: every
  * function value it sees (IAT slot contents, GetProcAddress results, COM methods) and every COM
  * object pointer it was given. Format (oracle/README.md "Register capture"):
- *   fn <value> <slot or 0> <name>      obj <pointer> <interface> */
+ *   fn <value> <slot or 0> <name>      obj <pointer> <interface>      vtbl <pointer> <interface> */
 void apitrace_osmap(void)
 {
     HANDLE f = spike_open("osmap.txt"); DWORD w; char ln[200];
@@ -526,6 +532,10 @@ void apitrace_osmap(void)
     }
     for (int i = 0; i < s_nobj; i++) {
         n = snprintf(ln, sizeof ln, "obj %x %s\n", s_obj[i].ptr, s_obj[i].iface >= 0 ? s_iface[s_obj[i].iface].name : "?");
+        WriteFile(f, ln, n, &w, NULL);
+    }
+    for (int i = 0; i < s_nvt; i++) {
+        n = snprintf(ln, sizeof ln, "vtbl %x %s\n", (uint32_t)s_vt_done[i], s_iface[s_vt_iface[i]].name);
         WriteFile(f, ln, n, &w, NULL);
     }
     CloseHandle(f);
@@ -872,7 +882,9 @@ int apitrace_install(int trace)
         spike_log("apitrace: arena not available at %#x/%#x; refusing (a moved arena could shift game memory)\n", ARENA_BASE, OUT_BASE);
         return 0;
     }
-    s_thunks = s_arena; s_misc = s_thunks + 0x100000;
+    s_thunks = VirtualAlloc((void *)THUNK_BASE, THUNK_SIZE, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+    if (!s_thunks) { spike_log("apitrace: thunk area not available at %#x\n", THUNK_BASE); return 0; }
+    s_misc = s_arena + 0x100000;
     at_priv_top = (uint32_t)(s_misc + 0x00C00000u + 0x00400000u - 64);   /* 4 MiB private stack */
     if (!load_sigs()) { spike_log("apitrace: FATAL: apisig.txt has errors\n"); return 0; }
     g_apitrace_on = trace;

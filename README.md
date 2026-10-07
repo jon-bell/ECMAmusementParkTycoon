@@ -29,7 +29,8 @@ oracle/      hook DLL (built as dinput.dll): pins, trace, input replay; README d
 scripts/     setup-host.sh, install-native.sh, oracle-run.sh, gate-determinism.sh
 tools/       rcttrace.py (read/compare traces), gate_determinism.py, rctdis.py, rctcfg.py (code map),
              coverbisect.py, ptrmask.py, dumpdiff.py
-docs/        stage1-scope.md
+lift/        Stage 1: lifter (lifter.py), runtime, Win32 host, tests (incl. real-CPU differential)
+docs/        stage1-scope.md, stage1-design.md, wine-answers.md
 corpus/      input scripts: public/ and heldout/ (see corpus/README.md)
 install/     registry written by Setup.exe
 game/        your CD contents and the pristine prefix (git-ignored)
@@ -50,6 +51,51 @@ Latest result (2026-10-06, `scripts/gate-determinism.sh`): **PASS**. 7 cases (4 
 held-out). Per run pair: 24,216 ticks, 477,705 RNG draws and 24,216 full-state hashes compared,
 all bit-identical. Every case's layout-shifted run is identical under the masked projection. All 4
 mutants were detected at their injection point.
+
+## Stage 1: the mechanical lift (accepted 2026-10-07)
+
+`lift/` translates every block of rct.exe (static code map v4: 92,055 blocks, 392k instructions,
+`.text` + CODESEG + CodeSeg) into JavaScript and runs it in Node 18 under a JS host that
+reproduces the oracle's pinned Win32 environment (`docs/stage1-design.md`). Generated code is
+derived from your rct.exe and stays in `out/lift/`.
+
+```
+.venv/bin/python lift/lifter.py                       # -> out/lift (and --no-flag-opt --out out/lift-ref)
+scripts/lift-run.sh out/lruns/x corpus/public/title.txt
+scripts/gate-lift.sh                                  # the Stage 1 gate -> out/gate-lift/<time>/report.txt
+```
+
+Gate result (oracle build `bb64337544163fd0`, lift host build `ea43519843d9c364`): **PASS**.
+
+| Stage | Result |
+|---|---|
+| trace | 43/43 cases identical to the oracle on projection `lift` (rng + masked state + commands + input). 364,240 ticks, 6.75M RNG draws, 364k masked state hashes, 5,367 commands. OS-side records identical in all 43; raw state hash identical in 41. |
+| coverage | 43/43: the lift executed exactly the blocks the binary executed |
+| register | 86/86 sampled tick windows identical instruction by instruction (59.8M block entries, 535M register comparisons, 36.4M written bytes) |
+| self-test | 4/4 trace mutants and 2/2 register mutants detected |
+
+What this does **not** certify:
+- 18.7% of lifted instructions are executed by no corpus case. They are lifted and checked
+  instruction-by-instruction on the real CPU (`lift/test/cpu`), but not in context.
+- Flag or register faults outside the sampled windows are caught only if they reach compared
+  state (the trace stage is blind to some; measured in the gate report).
+- Paths the corpus never takes: fullscreen DirectDraw, saved games, sound, multi-tick frames.
+- Environments other than this one: Wine 9.0 build, Xvfb 1024×768×24, this CPU's `cpuid` and
+  `GetSystemInfo`.
+
+Speed: the lift takes 1.6–4.4× the oracle's wall time per case.
+
+### Decisions awaiting review (principle 8)
+1. Corpus: loading scenarios the UI locks (5–20), building ride types not yet researched, scripted
+   UI clicks at fixed coordinates, and the cases left out (multi-tick frames, saved games, 7 of
+   49 commands). Details: `corpus/README.md`.
+2. New pins added during Stage 1: fixed register values after every OS call, deterministic file
+   search handles, scripted file dialogs (`oracle/README.md`).
+3. The host reproduces Wine's addresses (heap, DIB, CSG1 mapping, file handles) and the oracle's
+   stack depth for injected calls, so raw state matches too. The gate itself relies only on the
+   masked projection.
+4. Standard input is not pinned: its file type depends on how the oracle is launched. It reaches
+   only C-runtime data; proposal: launch with `</dev/null`.
 
 ## Stage 1 scoping
 

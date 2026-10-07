@@ -456,10 +456,12 @@ static void decode(uint32_t eip, const uint32_t r[8], pred_t *d)
         else if (op == 0xB1 || op == 0xC1) { mw = 1; size = opsz; }
         else if (op == 0xC7 && reg == 1) { mw = 1; size = 8; }
         if (mw && mod != 3 && (op == 0xAB || op == 0xB3 || op == 0xBB)) {
-            /* bit string with a register bit offset: the dword holding the bit */
-            int32_t off = (int32_t)r[reg];
-            uint32_t ea = modrm_ea(p, r, adsz, seg) + (uint32_t)((off >> 5) * 4);
-            d->w[0].addr = ea; d->w[0].size = 4; d->nw = 1; mw = 0;
+            /* bit string with a register bit offset (signed): the operand-size unit holding the
+             * bit, at ea + (offset >> 4) * 2 for 16-bit operands, ea + (offset >> 5) * 4 for 32 */
+            uint32_t ea = modrm_ea(p, r, adsz, seg);
+            if (opsz == 2) { int32_t off = (int16_t)r[reg]; ea += (uint32_t)((off >> 4) * 2); }
+            else { int32_t off = (int32_t)r[reg]; ea += (uint32_t)((off >> 5) * 4); }
+            d->w[0].addr = ea; d->w[0].size = opsz; d->nw = 1; mw = 0;
         }
     }
 #undef PUSH

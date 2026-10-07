@@ -225,10 +225,25 @@ offset OFF of the memory argument N points to, after the call. It is an experime
 comparing the run's `trace.bin` with an unperturbed `apitrace` run shows whether that answer
 reaches game state (`docs/wine-answers.md`).
 
-All instrument memory sits at fixed addresses Wine leaves free (`0x10000000`–`0x3FF00000`); so
-does the mask table every run uses (`0x3E000000`). A 4 MiB `.bss` array in the hook DLL moved the
-heap, the CSG1 view and the DIB (to `0x1A20000`, `0x3CA0000`, `0x52E0000`). At these addresses the
-layout is Wine's own: heap `0x1920000`, view `0x3C80000`, DIB `0x19A0000`. Also,
+All of the hook DLL's own memory sits at fixed addresses that Wine leaves free
+(`0x10000000`–`0x3FF00000`), so Wine places the game's memory where it would without the hook, in
+every run and for every script:
+
+| Address | What | When |
+|---|---|---|
+| `0x5EA70000` | register-pin / API-trace thunks (16 bytes each): the function values the game holds | every run |
+| `0x20000000` | the thunks' private stack, signature table, bookkeeping | every run |
+| `0x3C000000` | `FindFirstFileA` result sets (16 × 512 entries) | every run |
+| `0x3D000000` | the script's actions | every run |
+| `0x3E000000` | the mask table | every run |
+| `0x10000000` | `apitrace.txt` buffer | `apitrace` |
+| `0x24000000`, `0x28000000` | `istep` bitmap, register capture buffer | `istep` |
+| `0x2C000000` | `ptrscan` / `watch` tables | those modes |
+
+The layout the game sees is then Wine's own: heap `0x1920000`, CSG1.DAT view `0x3C80000`, DIB
+`0x19A0000`. Two earlier versions of the hook moved it, which is how the table above came about:
+a 4 MiB `.bss` array, and a script-length-dependent `realloc` of the action list (long scripts gave
+`0x1A20000` / `0x3CA0000` / `0x52E0000`). Also,
 `apitrace.txt` and `istep_regs.bin` are kept in memory and written at quit, so an instrument run
 receives the same heap addresses and handle numbers as a clean run. `apicount` and `apitrace`
 are exclusive.
@@ -377,19 +392,46 @@ A rep-prefixed `stos`/`movs` traps after every iteration and records one element
 count of 0 it records no write. After a game call into the OS the registers are those of the
 register pin (ecx = edx = 0, eflags `0x202`, eax = 0 for void functions).
 
-`osmap.txt` (written at quit with `istep` or `apitrace`) lists the OS-chosen values the game holds:
-`fn <value> <IAT slot or 0> <name>` for every function value it sees (IAT slot contents,
-`GetProcAddress` results, COM methods; under the oracle these are the register pin's thunks) and
-`obj <pointer> <interface>` for every COM object handed to it. The lift writes the same file with
-its own values (`HOST_BASE + 16*i`, its COM objects). `stepdiff.py diff` reads both (next to the
-captures, or `--osmap-oracle`/`--osmap-lift`) and compares such values by name in registers and
-4-byte writes.
+`osmap.txt` (written at quit with `istep` or `apitrace`) lists the OS-chosen values the game
+holds, one per line:
 
-Writes are predicted by decoding each instruction before it runs (ModRM destination operands,
-push/call/pushad/pushfd/enter, `stos`/`movs`, `mov moffs`, setcc, bit-string ops, shld/shrd,
-cmpxchg, xadd, x87 stores). Writes by OS code (`ReadFile` into a game buffer, ...) are not
-recorded. `tools/stepdiff.py verify` checks completeness: it applies the recorded writes to a state
-dump taken at tick A and compares the result with a dump at tick B+1.
+```
+fn <value> <IAT slot or 0> <name>   every function value it sees: IAT slot contents, GetProcAddress
+                                    results, COM methods (Iface::Method). Under the oracle these are
+                                    the register pin's thunks, at 0x5EA70000 + 16*i
+obj <pointer> <interface>           every COM object handed to the game, in order
+vtbl <pointer> <interface>          every COM vtable, in order of first use
+```
+
+The lift writes the same file with its own values (`HOST_BASE + 16*i`; its objects and vtables,
+`lift/host/host.js` `writeOsmap`). Objects and vtables are named `<kind>:<interface>#<n>` by their
+order per interface, so both files must list them in the order the game obtains them.
+
+`stepdiff.py diff` reads both files (next to the captures, or `--osmap-oracle`/`--osmap-lift`).
+In registers and 4-byte writes, two different values count as equal only if **both** are OS values
+with the same name. A value that is an OS value on one side only is compared raw. So game data that
+happens to equal a thunk or a host address is never renamed (a sprite flag `0x20000000` once
+collided with the thunk area). Mismatches involving an OS value are annotated `OS-derived?`. The
+oracle stream is reduced to the block starts the lift recorded; `--starts` is only cross-checked
+against them, since a code map of another version would drop or add oracle entries.
+
+Writes are predicted by decoding each instruction before it runs:
+- ModRM destination operands;
+- push/call/pushad/pushfd/enter;
+- `stos`/`movs`, and `mov moffs`;
+- setcc, shld/shrd, cmpxchg, xadd, x87 stores;
+- bit-string ops. `bts`/`btr`/`btc` with a register bit offset write the operand-size unit
+  holding the bit: `ea + (sext16(off) >> 4)*2` (16-bit) or `ea + (sext32(off) >> 5)*4` (32-bit).
+  Before 2026-10-07 the oracle recorded 4 bytes for the 16-bit form.
+
+Writes by OS code (`ReadFile` into a game buffer, ...) are not recorded. Two checks, which catch
+different defects:
+- `tools/stepdiff.py verify` finds missed writes. It applies the recorded writes to a state dump
+  taken at tick A and compares the result with a dump at tick B+1. It cannot see over-recording,
+  because extra bytes read back unchanged.
+- `.venv/bin/python tools/stepdiff.py audit CAPTURE...` finds wrong addresses and sizes. It decodes
+  every executed instruction independently (capstone), computes the addresses and sizes it writes
+  from the recorded registers, and compares them with the recorded writes, per instruction form.
 
 **Lift-side stream.** The lift emits the same file with header flags 0:
 - `R` at every entry to a block that is a block start of the code map, including fall-through
